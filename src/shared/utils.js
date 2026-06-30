@@ -114,6 +114,32 @@ export function quoteJql(value) {
 }
 
 /**
+ * Build a JQL `text ~` clause for a search term, choosing the right shape
+ * based on whether the term is a single word or a multi-word phrase.
+ *
+ *   - Single word ("STA"):      `text ~ "STA*"`    (prefix wildcard — matches
+ *                              "STA", "STA-123", "STA_report", etc.)
+ *   - Multi-word ("setup violation"): `text ~ "\"setup violation\""`  (exact
+ *                              phrase match — without this, Jira would treat
+ *                              the words as an AND/OR clause and miss the
+ *                              compound meaning)
+ *
+ * Backslashes and double quotes are escaped per JQL rules.
+ *
+ * @param {string} term
+ * @returns {string}
+ */
+export function buildJqlTextClause(term) {
+  const s = String(term || '');
+  const escaped = s.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  if (/\s/.test(s)) {
+    // Multi-word: phrase match. Inner escaped quotes signal phrase to Jira.
+    return `text ~ "\\"${escaped}\\""`;
+  }
+  return `text ~ "${escaped}*"`;
+}
+
+/**
  * Validate that a URL string is safe to use as an HTML href.
  * Only http: and https: protocols are allowed.
  * @param {string} url

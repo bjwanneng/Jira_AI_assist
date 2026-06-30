@@ -1,5 +1,5 @@
 import { ApiClient, simplifyIssue, simplifySearchResults, simplifyConfluenceResults, SlackClient, simplifySlackMessages, simplifySlackFiles, DriveClient, simplifyDriveFiles } from './api-client.js';
-import { extractTextFromHtml, parseAtlassianUrl, detectIssueKey, truncateToTokens } from '../shared/utils.js';
+import { extractTextFromHtml, parseAtlassianUrl, detectIssueKey, truncateToTokens, buildJqlTextClause } from '../shared/utils.js';
 import { reciprocalRankFusion } from '../shared/rrf.js';
 import { MAX_RERANK_CANDIDATES, MAX_RERANKED_RESULTS, RRF_K } from '../shared/constants.js';
 import { getOrSummarize } from './ticket-summarizer.js';
@@ -53,9 +53,9 @@ function buildFuzzyJql(query, filters = {}) {
     // Fallback: search the raw query as a phrase
     clauses.push(`text ~ "${escapeJqlString(query)}"`);
   } else {
-    // Each token becomes text ~ "tok*" — OR them together for high recall.
-    // Jira's text search already does stemming, so we don't need to over-engineer.
-    const tokenClauses = tokens.map(t => `text ~ "${escapeJqlString(t)}*"`).join(' OR ');
+    // Each token becomes a text clause (prefix wildcard for single words,
+    // phrase match for multi-word). OR them together for high recall.
+    const tokenClauses = tokens.map(t => buildJqlTextClause(t)).join(' OR ');
     clauses.push(`(${tokenClauses})`);
   }
 
@@ -429,7 +429,7 @@ export class ToolExecutor {
     const channels = [];
     if (expansion.primaryTerms?.length) {
       const textOr = expansion.primaryTerms
-        .map((t) => `text ~ "${String(t).replace(/"/g, '\\"')}*"`)
+        .map((t) => buildJqlTextClause(t))
         .join(' OR ');
       channels.push({
         tier: 1,
@@ -438,7 +438,7 @@ export class ToolExecutor {
     }
     if (expansion.synonyms?.length) {
       const textOr = expansion.synonyms
-        .map((t) => `text ~ "${String(t).replace(/"/g, '\\"')}*"`)
+        .map((t) => buildJqlTextClause(t))
         .join(' OR ');
       channels.push({
         tier: 2,

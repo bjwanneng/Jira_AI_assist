@@ -16,6 +16,7 @@
 import { getExpandedQuery, setExpandedQuery, hashQuery } from '../shared/db.js';
 import { QUERY_EXPANSION_SCHEMA_VERSION } from '../shared/constants.js';
 import { parseLlmJson } from '../shared/llm-json.js';
+import { expandWithOntology } from '../shared/ontology.js';
 
 const EXPANDER_SYSTEM_PROMPT = `You expand a search query into two token lists for Jira full-text search.
 Return ONLY a JSON object (no prose, no markdown fence):
@@ -41,6 +42,32 @@ function normalizeExpansion(parsed) {
 }
 
 /**
+ * Merge ontology-detected concepts into an expansion. The ontology is a
+ * deterministic backbone that guarantees domain synonyms (e.g. "timing" →
+ * "STA, setup, hold, slack, ...") regardless of whether the LLM knew the
+ * chip-design jargon. Surface forms go into `synonyms` (broad-recall
+ * Channel B), and the canonical concept keys go into `concepts` for
+ * downstream filtering / display.
+ *
+ * Mutates and returns the expansion.
+ */
+function enrichWithOntology(expansion, query) {
+  if (!expansion) return expansion;
+  const ontologyHit = expandWithOntology(
+    [query, ...(expansion.primaryTerms || []), ...(expansion.synonyms || [])]
+  );
+  expansion.concepts = ontologyHit.concepts;
+  const merged = new Set([
+    ...(expansion.synonyms || []),
+    ...ontologyHit.expandedTerms
+  ]);
+  expansion.synonyms = Array.from(merged)
+    .filter((s) => s.length >= 2 && s.length <= 32)
+    .slice(0, 14);
+  return expansion;
+}
+
+/**
  * Expand a free-form query into { primaryTerms, synonyms }.
  * Returns null on failure.
  *
@@ -58,9 +85,10 @@ export async function expandQuery(query, llm) {
     ]);
     const normalized = normalizeExpansion(parseLlmJson(response?.content || ''));
     if (!normalized) return null;
+    const enriched = enrichWithOntology(normalized, query);
     const hash = await hashQuery(query);
-    await setExpandedQuery(hash, normalized, QUERY_EXPANSION_SCHEMA_VERSION);
-    return normalized;
+    await setExpandedQuery(hash, enriched, QUERY_EXPANSION_SCHEMA_VERSION);
+    return enriched;
   } catch (err) {
     console.warn('[query-expander] failed for', query, err.message);
     return null;

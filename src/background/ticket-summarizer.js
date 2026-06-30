@@ -28,6 +28,7 @@ import {
 } from '../shared/utils.js';
 import { IssueExtractor } from '../content/issue-extractor.js';
 import { parseLlmJson } from '../shared/llm-json.js';
+import { expandWithOntology } from '../shared/ontology.js';
 
 const SUMMARIZER_SYSTEM_PROMPT = `You extract structured features from a Jira ticket for similarity search.
 Return ONLY a JSON object with this exact shape (no prose, no markdown fence needed):
@@ -82,12 +83,20 @@ Return the JSON now.`;
 }
 
 /**
- * Sanitize and merge LLM output with rule-based hints.
- * @param {object} parsed
+ * Sanitize and merge LLM output with rule-based hints + domain ontology.
+ *
+ * The ontology step is the "auto-tagging" stage from the Rovo-style pipeline:
+ * we scan the ticket's own text for domain concept surface forms (e.g.
+ * "setup violation" → timing concept) even if the LLM didn't tag it. This
+ * lets the search pipeline find other Timing tickets when matching against
+ * a ticket that never uses the word "timing".
+ *
+ * @param {object} parsed - LLM output
  * @param {object} hints - output of IssueExtractor.extractIpHints
+ * @param {string} fullText - the ticket's full text (summary + description + comments)
  * @returns {object}
  */
-function normalizeSummary(parsed, hints) {
+function normalizeSummary(parsed, hints, fullText) {
   if (!parsed || typeof parsed !== 'object') return null;
 
   const asStringArr = (v) => {
@@ -104,7 +113,26 @@ function normalizeSummary(parsed, hints) {
     hints?.coreName,
     hints?.productLine
   ].filter(Boolean));
-  const searchKeywords = Array.from(kws).slice(0, 10);
+  let searchKeywords = Array.from(kws).slice(0, 10);
+
+  // Run the domain ontology on the ticket's full text + extracted keywords.
+  // This is the deterministic backbone: even if the LLM doesn't know chip-
+  // design jargon, we still detect "this ticket is about Timing" from
+  // surface forms like "setup violation" / "STA report".
+  const ontologyHit = expandWithOntology(
+    [fullText, ...(parsed.searchKeywords || []), ...(parsed.synonyms || [])]
+  );
+
+  // Add canonical concept names to searchKeywords so Channel A (BM25 precise)
+  // can match other tickets that DO mention "timing" by name.
+  searchKeywords = Array.from(new Set([...searchKeywords, ...ontologyHit.concepts])).slice(0, 12);
+
+  // Add all surface forms to synonyms so Channel B (semantic-approx) catches
+  // other tickets using any of the concept's jargon.
+  const synonyms = Array.from(new Set([
+    ...(asStringArr(parsed.synonyms)),
+    ...ontologyHit.expandedTerms
+  ])).slice(0, 16);
 
   return {
     phenomenon: typeof parsed.phenomenon === 'string' ? parsed.phenomenon.slice(0, 200) : '',
@@ -113,7 +141,8 @@ function normalizeSummary(parsed, hints) {
     rootCauseCategory:
       typeof parsed.rootCauseCategory === 'string' ? parsed.rootCauseCategory.slice(0, 60) : '',
     searchKeywords,
-    synonyms: asStringArr(parsed.synonyms)
+    synonyms,
+    concepts: ontologyHit.concepts
   };
 }
 
@@ -135,8 +164,16 @@ export async function summarizeTicket(issue, llm) {
       { role: 'user', content: buildUserPrompt(issue) }
     ]);
     const parsed = parseLlmJson(response?.content || '');
-    const hints = IssueExtractor.extractIpHints(issue.fields || {});
-    const normalized = normalizeSummary(parsed, hints);
+    const fields = issue.fields || {};
+    const hints = IssueExtractor.extractIpHints(fields);
+    // Rebuild the full text so the ontology scan sees everything the LLM saw.
+    const descriptionText = extractDescriptionText(fields.description);
+    const commentsText = (fields.comment?.comments || [])
+      .slice(-MAX_COMMENTS)
+      .map(extractCommentText)
+      .join('\n');
+    const fullText = `${fields.summary || ''}\n${descriptionText}\n${commentsText}`;
+    const normalized = normalizeSummary(parsed, hints, fullText);
     if (!normalized) return null;
     await setSummary(issue.key, normalized, SUMMARY_SCHEMA_VERSION);
     return normalized;

@@ -1,5 +1,5 @@
 import { JIRA_FIELDS, MAX_RELATED_ISSUES, MAX_CONFLUENCE_RESULTS, ATLASSIAN_API_BASE, MAX_RERANK_CANDIDATES, RRF_K } from '../shared/constants.js';
-import { extractDescriptionText, extractCommentText, formatIssue, formatComment, quoteJql } from '../shared/utils.js';
+import { extractDescriptionText, extractCommentText, formatIssue, formatComment, quoteJql, buildJqlTextClause } from '../shared/utils.js';
 import { IssueExtractor } from '../content/issue-extractor.js';
 import { reciprocalRankFusion } from '../shared/rrf.js';
 
@@ -273,7 +273,7 @@ export class ApiClient {
 
     // Channel A: project + components + keywords (BM25 precise channel)
     if (keywords.length > 0) {
-      const textOr = keywords.map(t => `text ~ ${quoteJql(t + '*')}`).join(' OR ');
+      const textOr = keywords.map(t => buildJqlTextClause(t)).join(' OR ');
       const compClause = components.length > 0
         ? ` AND component in (${components.map(quoteJql).join(',')})`
         : '';
@@ -285,7 +285,7 @@ export class ApiClient {
 
     // Channel B: project + synonyms (semantic-approx channel)
     if (synonyms.length > 0) {
-      const textOr = synonyms.map(t => `text ~ ${quoteJql(t + '*')}`).join(' OR ');
+      const textOr = synonyms.map(t => buildJqlTextClause(t)).join(' OR ');
       queries.push({
         tier: 2,
         jql: `project = ${projectKey} AND ${excludeCurrent} AND (${textOr}) ORDER BY updated DESC`
@@ -383,7 +383,7 @@ export class ApiClient {
       return { issues: [], reason: 'no_keywords' };
     }
 
-    const textOr = tokens.map(t => `text ~ ${quoteJql(t + '*')}`).join(' OR ');
+    const textOr = tokens.map(t => buildJqlTextClause(t)).join(' OR ');
     const excludeCurrent = `key != ${issue.key}`;
     const includeCrossProject = options.includeCrossProject !== false;
 
