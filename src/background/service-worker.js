@@ -90,7 +90,31 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             });
           }
 
-          const data = await orchestrator.handle(message.payload);
+          // Stream reasoning tokens back to the chat UI in real-time.
+          // Extension pages (chrome-extension://...) listen on
+          // chrome.runtime.onMessage and filter by conversationId. Content
+          // scripts in Jira tabs receive via chrome.tabs.sendMessage for
+          // targeted delivery — no filter needed.
+          const conversationId = message.payload.conversationId;
+          const senderTabId = sender.tab?.id;
+          const isExtensionPage = sender.url?.startsWith('chrome-extension://');
+          const onDelta = (delta) => {
+            try {
+              const msg = {
+                type: MESSAGE_TYPES.CHAT_DELTA,
+                payload: { ...delta, conversationId }
+              };
+              if (isExtensionPage) {
+                chrome.runtime.sendMessage(msg).catch(() => {});
+              } else if (senderTabId !== undefined) {
+                chrome.tabs.sendMessage(senderTabId, msg).catch(() => {});
+              }
+            } catch (e) {
+              // SW may have just started; ignore send failures.
+            }
+          };
+
+          const data = await orchestrator.handle(message.payload, onDelta);
           return sendResponse({ success: true, data });
         }
 

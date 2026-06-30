@@ -105,7 +105,7 @@ export class ChatOrchestrator {
     }
   }
 
-  async handle({ message, issueKey, pageUrl }) {
+  async handle({ message, issueKey, pageUrl }, onDelta) {
     await this.ensureRestored();
 
     // Load current context on first run
@@ -143,7 +143,21 @@ export class ChatOrchestrator {
         ...this.conversationHistory
       ];
 
-      const response = await this.llm.chat(messages);
+      // Compute this round's number BEFORE the LLM call so streaming deltas
+      // can carry it. Count = existing reasoning entries + 1 (same as the
+      // post-call computation below).
+      const round = toolCalls.filter((t) => t.name === 'reasoning').length + 1;
+      let roundStarted = false;
+      const response = await this.llm.chatStream(messages, {}, (delta) => {
+        if (delta.reasoning && onDelta) {
+          if (!roundStarted) {
+            roundStarted = true;
+            onDelta({ kind: 'reasoning_start', round, text: delta.reasoning });
+          } else {
+            onDelta({ kind: 'reasoning_delta', round, text: delta.reasoning });
+          }
+        }
+      });
       const content = response.content || '';
       // Reasoning models (GLM-4.5/4.6, DeepSeek-R1, QwQ, ...) put their
       // chain-of-thought in `reasoning_content`, NOT in `content`. Non-reasoning
@@ -154,12 +168,14 @@ export class ChatOrchestrator {
       // Surface every round's thinking to the UI — don't dedup. In a multi-
       // round tool loop the user wants to see "plan search" → "review results"
       // → "synthesize answer" as separate cards, not just the first one.
+      // The `_streamed` flag tells the UI the thinking was already rendered
+      // incrementally via CHAT_DELTA — skip re-rendering it from the final
+      // response to avoid a duplicate card.
       if (reasoning) {
-        const round = toolCalls.filter((t) => t.name === 'reasoning').length + 1;
         toolCalls.push({
           name: 'reasoning',
           args: {},
-          result: { thought: reasoning, round, _displayOnly: true }
+          result: { thought: reasoning, round, _displayOnly: true, _streamed: roundStarted }
         });
       }
 

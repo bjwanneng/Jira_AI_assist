@@ -13,6 +13,10 @@ export class ChatUI {
     this.sendBtn = null;
     this.isLoading = false;
     this.isOpen = false;
+    // Streaming state shared between onSend() and the CHAT_DELTA listener.
+    // Set when a CHAT_MESSAGE is dispatched, cleared in onSend's finally.
+    this.activeStreamState = null;
+    this._deltaListener = null;
   }
 
   mount(parent) {
@@ -62,9 +66,50 @@ export class ChatUI {
       }
     });
 
+    // Register the CHAT_DELTA listener once. We keep a reference so we could
+    // remove it on unmount, but in practice the ChatUI lives as long as the
+    // tab, so we leave it attached.
+    this._deltaListener = (message, sender, sendResponse) => {
+      if (message.type !== MESSAGE_TYPES.CHAT_DELTA) return false;
+      this.handleStreamDelta(message.payload || {});
+      return false;
+    };
+    chrome.runtime.onMessage.addListener(this._deltaListener);
+
     this.isOpen = true;
     this.addAssistantMessage('Hi! I can help summarize tickets, search related issues, check Confluence, or draft replies. What would you like to know?');
     this.loadContext();
+  }
+
+  /**
+   * Incrementally render a reasoning chunk streamed from the LLM. The first
+   * chunk of each round creates a new thinking card (replacing the placeholder
+   * on round 1); subsequent chunks append to the current card's body and
+   * re-render markdown so lists/code blocks format correctly as they arrive.
+   */
+  handleStreamDelta(payload) {
+    if (!this.activeStreamState) return;
+    if (payload.kind === 'reasoning_start') {
+      this.activeStreamState.round = payload.round;
+      this.activeStreamState.text = payload.text || '';
+      const el = this.buildThinkingElement(this.activeStreamState.text, payload.round);
+      if (this.activeStreamState.placeholder && this.activeStreamState.placeholder.isConnected) {
+        this.activeStreamState.placeholder.replaceWith(el);
+        this.activeStreamState.placeholder = null;
+      } else {
+        this.messagesEl.appendChild(el);
+      }
+      this.activeStreamState.currentEl = el;
+      this.scrollToBottom();
+    } else if (payload.kind === 'reasoning_delta') {
+      if (!this.activeStreamState.currentEl) return;
+      this.activeStreamState.text += payload.text || '';
+      const body = this.activeStreamState.currentEl.querySelector('.thinking-body');
+      if (body) {
+        body.innerHTML = renderMarkdown(this.activeStreamState.text);
+        this.scrollToBottom();
+      }
+    }
   }
 
   async loadContext() {
@@ -103,6 +148,7 @@ export class ChatUI {
     this.inputEl.value = '';
     this.setLoading(true);
     const placeholder = this.addThinkingPlaceholder();
+    this.activeStreamState = { placeholder, currentEl: null, text: '', round: 0 };
 
     try {
       const response = await chrome.runtime.sendMessage({
@@ -135,6 +181,7 @@ export class ChatUI {
       }
     } finally {
       if (placeholder && placeholder.isConnected) placeholder.remove();
+      this.activeStreamState = null;
       this.setLoading(false);
     }
   }
@@ -174,15 +221,18 @@ export class ChatUI {
   }
 
   renderResponse(data, placeholder) {
-    let firstReasoning = true;
+    let sawStreamedReasoning = false;
     if (data.toolCalls?.length) {
       for (const tool of data.toolCalls) {
         if (tool.name === 'reasoning') {
           const thought = tool.result?.thought;
           const round = tool.result?.round;
-          if (firstReasoning && placeholder) {
+          const streamed = tool.result?._streamed;
+          if (streamed) {
+            // Already rendered incrementally via CHAT_DELTA — skip re-render.
+            sawStreamedReasoning = true;
+          } else if (placeholder && placeholder.isConnected) {
             placeholder.replaceWith(this.buildThinkingElement(thought, round));
-            firstReasoning = false;
           } else {
             this.addThinkingMessage(thought, round);
           }
@@ -191,7 +241,10 @@ export class ChatUI {
         this.addToolMessage(tool.name, tool.args, tool.result);
       }
     }
-    if (firstReasoning && placeholder) placeholder.remove();
+    // Drop the placeholder if no streamed reasoning consumed it.
+    if (!sawStreamedReasoning && placeholder && placeholder.isConnected) {
+      placeholder.remove();
+    }
     if (Array.isArray(data.sources) && data.sources.length > 0) {
       this.addSourcesCards(data.sources);
     }

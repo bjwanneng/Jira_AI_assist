@@ -29,6 +29,46 @@ const contextState = new ContextState('global');
 let isLoading = false;
 let activeConversationId = null;
 
+// Streaming state shared between onSend() and the CHAT_DELTA listener.
+// Set when a CHAT_MESSAGE is dispatched, cleared in onSend's finally block.
+// The listener uses it to (a) consume the placeholder on the first reasoning
+// chunk of round 1, and (b) append subsequent chunks to the right card.
+let activeStreamState = null;
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.type !== MESSAGE_TYPES.CHAT_DELTA) return false;
+  const payload = message.payload || {};
+  // Ignore deltas for other conversations (e.g. another open chat tab).
+  if (payload.conversationId && payload.conversationId !== activeConversationId) return false;
+  handleStreamDelta(payload);
+  return false;
+});
+
+function handleStreamDelta(payload) {
+  if (!activeStreamState) return;
+  if (payload.kind === 'reasoning_start') {
+    activeStreamState.round = payload.round;
+    activeStreamState.text = payload.text || '';
+    const el = buildThinkingElement(activeStreamState.text, payload.round);
+    if (activeStreamState.placeholder && activeStreamState.placeholder.isConnected) {
+      activeStreamState.placeholder.replaceWith(el);
+      activeStreamState.placeholder = null;
+    } else {
+      messagesEl.appendChild(el);
+    }
+    activeStreamState.currentEl = el;
+    scrollToBottom();
+  } else if (payload.kind === 'reasoning_delta') {
+    if (!activeStreamState.currentEl) return;
+    activeStreamState.text += payload.text || '';
+    const body = activeStreamState.currentEl.querySelector('.thinking-body');
+    if (body) {
+      body.innerHTML = renderMarkdown(activeStreamState.text);
+      scrollToBottom();
+    }
+  }
+}
+
 // ---------- Conversation management ----------
 
 async function startNewConversation() {
@@ -164,6 +204,9 @@ async function onSend() {
   // assistant is working on their question — replaced by the first real
   // thinking card once the response arrives.
   const placeholder = addThinkingPlaceholder();
+  // Set up streaming state so the CHAT_DELTA listener can consume the
+  // placeholder and append reasoning chunks to the right card.
+  activeStreamState = { placeholder, currentEl: null, text: '', round: 0 };
   renderHistory();
 
   try {
@@ -180,18 +223,25 @@ async function onSend() {
 
     if (response?.success) {
       const data = response.data || {};
-      let firstReasoning = true;
+      let sawStreamedReasoning = false;
       if (Array.isArray(data.toolCalls)) {
         for (const tool of data.toolCalls) {
           if (tool.name === 'reasoning') {
             const thought = tool.result?.thought;
             const round = tool.result?.round;
-            if (firstReasoning && placeholder) {
-              // Replace the placeholder with the first real thinking card.
-              placeholder.replaceWith(buildThinkingElement(thought, round));
-              firstReasoning = false;
+            const streamed = tool.result?._streamed;
+            if (streamed) {
+              // Already rendered incrementally via CHAT_DELTA — don't
+              // re-render, just persist to the conversation store.
+              sawStreamedReasoning = true;
             } else {
-              addThinkingMessage(thought, round);
+              // Fallback path (model produced no reasoning_content, or used
+              // the <reasoning> tag convention that we don't stream).
+              if (placeholder && placeholder.isConnected) {
+                placeholder.replaceWith(buildThinkingElement(thought, round));
+              } else {
+                addThinkingMessage(thought, round);
+              }
             }
             await appendMessage(activeConversationId, { role: 'thinking', content: thought });
             continue;
@@ -204,9 +254,9 @@ async function onSend() {
           await appendMessage(activeConversationId, { role: 'tool', toolName: tool.name, summary });
         }
       }
-      // If the model produced no reasoning at all, drop the placeholder —
-      // we don't want an empty "Thinking..." card lingering above the answer.
-      if (firstReasoning && placeholder) {
+      // If the model produced no reasoning at all (streamed or otherwise),
+      // drop the placeholder so it doesn't linger above the answer.
+      if (!sawStreamedReasoning && placeholder && placeholder.isConnected) {
         placeholder.remove();
       }
       // Render rich source cards (with rerank score + reason) before the
@@ -253,6 +303,7 @@ async function onSend() {
     if (placeholder && placeholder.isConnected) {
       placeholder.remove();
     }
+    activeStreamState = null;
     setLoading(false);
   }
 }
