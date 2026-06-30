@@ -160,6 +160,10 @@ async function onSend() {
   inputEl.value = '';
   inputEl.style.height = 'auto';
   setLoading(true, 'Thinking...');
+  // Show a thinking placeholder in the message stream so the user sees the
+  // assistant is working on their question — replaced by the first real
+  // thinking card once the response arrives.
+  const placeholder = addThinkingPlaceholder();
   renderHistory();
 
   try {
@@ -176,11 +180,19 @@ async function onSend() {
 
     if (response?.success) {
       const data = response.data || {};
+      let firstReasoning = true;
       if (Array.isArray(data.toolCalls)) {
         for (const tool of data.toolCalls) {
           if (tool.name === 'reasoning') {
             const thought = tool.result?.thought;
-            addThinkingMessage(thought);
+            const round = tool.result?.round;
+            if (firstReasoning && placeholder) {
+              // Replace the placeholder with the first real thinking card.
+              placeholder.replaceWith(buildThinkingElement(thought, round));
+              firstReasoning = false;
+            } else {
+              addThinkingMessage(thought, round);
+            }
             await appendMessage(activeConversationId, { role: 'thinking', content: thought });
             continue;
           }
@@ -191,6 +203,11 @@ async function onSend() {
           addToolMessage(tool.name, summary);
           await appendMessage(activeConversationId, { role: 'tool', toolName: tool.name, summary });
         }
+      }
+      // If the model produced no reasoning at all, drop the placeholder —
+      // we don't want an empty "Thinking..." card lingering above the answer.
+      if (firstReasoning && placeholder) {
+        placeholder.remove();
       }
       // Render rich source cards (with rerank score + reason) before the
       // final answer streams in. Mirrors how Rovo surfaces its top hits.
@@ -230,6 +247,12 @@ async function onSend() {
       await appendMessage(activeConversationId, { role: 'error', content: err.message });
     }
   } finally {
+    // Safety net: if the placeholder never got replaced by a real thinking
+    // card (error path, or model produced no reasoning), remove it so it
+    // doesn't linger above the answer / error message.
+    if (placeholder && placeholder.isConnected) {
+      placeholder.remove();
+    }
     setLoading(false);
   }
 }
@@ -311,18 +334,46 @@ function addAssistantMessage(text) {
   scrollToBottom();
 }
 
-function addThinkingMessage(text) {
+function addThinkingMessage(text, round) {
   if (!text) return;
+  const el = buildThinkingElement(text, round);
+  messagesEl.appendChild(el);
+  scrollToBottom();
+}
+
+function buildThinkingElement(text, round) {
+  const el = document.createElement('div');
+  el.className = 'message thinking';
+  const roundBadge = typeof round === 'number' && round > 0
+    ? `<span class="thinking-round">round ${round}</span>`
+    : '';
+  el.innerHTML = `
+    <details class="thinking-card" open>
+      <summary>
+        <span class="thinking-summary-label">💭 Thinking</span>
+        ${roundBadge}
+      </summary>
+      <div class="thinking-body">${renderMarkdown(text)}</div>
+    </details>
+  `;
+  return el;
+}
+
+function addThinkingPlaceholder() {
   const el = document.createElement('div');
   el.className = 'message thinking';
   el.innerHTML = `
-    <details class="thinking-card" open>
-      <summary>💭 Thinking</summary>
-      <div class="thinking-body">${renderMarkdown(text)}</div>
+    <details class="thinking-card thinking-placeholder" open>
+      <summary>
+        <span class="thinking-summary-label">💭 Thinking</span>
+        <span class="thinking-dots"><span class="tdot"></span><span class="tdot"></span><span class="tdot"></span></span>
+      </summary>
+      <div class="thinking-body thinking-body-placeholder">analyzing your request…</div>
     </details>
   `;
   messagesEl.appendChild(el);
   scrollToBottom();
+  return el;
 }
 
 function addToolMessage(name, summary) {

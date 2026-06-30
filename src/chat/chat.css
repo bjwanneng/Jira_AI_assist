@@ -543,41 +543,102 @@ a { color: #0052cc; }
 .message.thinking { justify-content: flex-start; }
 .thinking-card {
   max-width: 75%;
-  background: #f0f4ff;
-  border: 1px solid #c7d2fe;
-  border-left: 3px solid #4c9aff;
+  background: #0f172a;
+  border: 1px solid #1e293b;
+  border-left: 3px solid #38bdf8;
   border-radius: 6px;
   font-size: 13px;
   overflow: hidden;
+  color: #cbd5e1;
+  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.12);
 }
 .thinking-card summary {
   padding: 8px 12px;
   cursor: pointer;
-  font-weight: 500;
-  color: #1e40af;
+  font-weight: 600;
+  color: #e0f2fe;
   user-select: none;
   list-style: none;
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
+  background: #1e293b;
 }
 .thinking-card summary::-webkit-details-marker { display: none; }
 .thinking-card summary::before {
   content: "▸";
   font-size: 10px;
+  color: #38bdf8;
   transition: transform 0.15s;
 }
 .thinking-card[open] summary::before { transform: rotate(90deg); }
-.thinking-card[open] summary { border-bottom: 1px solid #c7d2fe; }
+.thinking-card[open] summary { border-bottom: 1px solid #334155; }
+.thinking-summary-label { font-size: 12.5px; }
+.thinking-round {
+  font-size: 10.5px;
+  font-weight: 500;
+  color: #38bdf8;
+  background: rgba(56, 189, 248, 0.12);
+  padding: 1px 7px;
+  border-radius: 8px;
+  border: 1px solid rgba(56, 189, 248, 0.25);
+  font-family: 'SF Mono', Monaco, Consolas, monospace;
+  letter-spacing: 0.02em;
+}
 .thinking-body {
   padding: 10px 14px;
-  color: #312e81;
-  line-height: 1.55;
-  font-size: 12.5px;
-  background: #f8faff;
+  color: #cbd5e1;
+  line-height: 1.6;
+  font-size: 12px;
+  font-family: 'SF Mono', Monaco, Consolas, 'Courier New', monospace;
+  background: #0f172a;
+  max-height: 280px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 .thinking-body p { margin: 4px 0; }
-.thinking-body strong { color: #1e3a8a; }
+.thinking-body strong { color: #f1f5f9; font-weight: 600; }
+.thinking-body em { color: #bae6fd; font-style: italic; }
+.thinking-body code {
+  background: rgba(56, 189, 248, 0.12);
+  color: #7dd3fc;
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-size: 11.5px;
+}
+.thinking-body::-webkit-scrollbar { width: 6px; }
+.thinking-body::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+.thinking-body::-webkit-scrollbar-track { background: transparent; }
+
+/* Placeholder "Thinking…" card shown while the LLM call is in flight. */
+.thinking-placeholder summary { cursor: default; }
+.thinking-placeholder .thinking-summary-label { color: #94a3b8; }
+.thinking-body-placeholder {
+  color: #64748b;
+  font-style: italic;
+  font-family: inherit;
+  font-size: 12px;
+  padding: 12px 14px;
+}
+.thinking-dots {
+  display: inline-flex;
+  gap: 3px;
+  align-items: center;
+}
+.thinking-dots .tdot {
+  width: 4px;
+  height: 4px;
+  background: #38bdf8;
+  border-radius: 50%;
+  animation: thinking-bounce 1s infinite;
+}
+.thinking-dots .tdot:nth-child(2) { animation-delay: 0.15s; }
+.thinking-dots .tdot:nth-child(3) { animation-delay: 0.3s; }
+@keyframes thinking-bounce {
+  0%, 80%, 100% { transform: translateY(0); opacity: 0.4; }
+  40% { transform: translateY(-3px); opacity: 1; }
+}
 
 /* ---------- Scrollbar ---------- */
 .history-list::-webkit-scrollbar { width: 6px; }

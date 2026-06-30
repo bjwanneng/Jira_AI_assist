@@ -102,6 +102,7 @@ export class ChatUI {
     this.addUserMessage(text);
     this.inputEl.value = '';
     this.setLoading(true);
+    const placeholder = this.addThinkingPlaceholder();
 
     try {
       const response = await chrome.runtime.sendMessage({
@@ -114,7 +115,7 @@ export class ChatUI {
       });
 
       if (response.success) {
-        this.renderResponse(response.data);
+        this.renderResponse(response.data, placeholder);
       } else {
         const errObj = response.error || {};
         const errMsg = errObj.message || response.error || 'Unknown error';
@@ -133,6 +134,7 @@ export class ChatUI {
         this.addErrorMessage(err.message || 'Failed to reach background service.');
       }
     } finally {
+      if (placeholder && placeholder.isConnected) placeholder.remove();
       this.setLoading(false);
     }
   }
@@ -171,18 +173,73 @@ export class ChatUI {
     }
   }
 
-  renderResponse(data) {
+  renderResponse(data, placeholder) {
+    let firstReasoning = true;
     if (data.toolCalls?.length) {
       for (const tool of data.toolCalls) {
+        if (tool.name === 'reasoning') {
+          const thought = tool.result?.thought;
+          const round = tool.result?.round;
+          if (firstReasoning && placeholder) {
+            placeholder.replaceWith(this.buildThinkingElement(thought, round));
+            firstReasoning = false;
+          } else {
+            this.addThinkingMessage(thought, round);
+          }
+          continue;
+        }
         this.addToolMessage(tool.name, tool.args, tool.result);
       }
     }
+    if (firstReasoning && placeholder) placeholder.remove();
     if (Array.isArray(data.sources) && data.sources.length > 0) {
       this.addSourcesCards(data.sources);
     }
     if (data.content) {
       this.addAssistantMessage(data.content);
     }
+  }
+
+  addThinkingMessage(text, round) {
+    if (!text) return;
+    const el = this.buildThinkingElement(text, round);
+    this.messagesEl.appendChild(el);
+    this.scrollToBottom();
+  }
+
+  buildThinkingElement(text, round) {
+    const el = document.createElement('div');
+    el.className = 'message thinking';
+    const roundBadge = typeof round === 'number' && round > 0
+      ? `<span class="thinking-round">round ${escapeHtml(String(round))}</span>`
+      : '';
+    el.innerHTML = `
+      <details class="thinking-card" open>
+        <summary>
+          <span class="thinking-summary-label">💭 Thinking</span>
+          ${roundBadge}
+        </summary>
+        <div class="thinking-body">${renderMarkdown(text)}</div>
+      </details>
+    `;
+    return el;
+  }
+
+  addThinkingPlaceholder() {
+    const el = document.createElement('div');
+    el.className = 'message thinking';
+    el.innerHTML = `
+      <details class="thinking-card thinking-placeholder" open>
+        <summary>
+          <span class="thinking-summary-label">💭 Thinking</span>
+          <span class="thinking-dots"><span class="tdot"></span><span class="tdot"></span><span class="tdot"></span></span>
+        </summary>
+        <div class="thinking-body thinking-body-placeholder">analyzing your request…</div>
+      </details>
+    `;
+    this.messagesEl.appendChild(el);
+    this.scrollToBottom();
+    return el;
   }
 
   addSourcesCards(sources) {
@@ -439,6 +496,91 @@ export class ChatUI {
         color: #44546a;
         font-style: italic;
         line-height: 1.4;
+      }
+      .message.thinking { justify-content: flex-start; }
+      .thinking-card {
+        max-width: 90%;
+        background: #0f172a;
+        border: 1px solid #1e293b;
+        border-left: 3px solid #38bdf8;
+        border-radius: 6px;
+        font-size: 12px;
+        overflow: hidden;
+        color: #cbd5e1;
+        box-shadow: 0 1px 3px rgba(15, 23, 42, 0.12);
+      }
+      .thinking-card summary {
+        padding: 7px 10px;
+        cursor: pointer;
+        font-weight: 600;
+        color: #e0f2fe;
+        user-select: none;
+        list-style: none;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        background: #1e293b;
+      }
+      .thinking-card summary::-webkit-details-marker { display: none; }
+      .thinking-card summary::before {
+        content: "▸";
+        font-size: 9px;
+        color: #38bdf8;
+        transition: transform 0.15s;
+      }
+      .thinking-card[open] summary::before { transform: rotate(90deg); }
+      .thinking-card[open] summary { border-bottom: 1px solid #334155; }
+      .thinking-summary-label { font-size: 12px; }
+      .thinking-round {
+        font-size: 10px;
+        font-weight: 500;
+        color: #38bdf8;
+        background: rgba(56, 189, 248, 0.12);
+        padding: 1px 6px;
+        border-radius: 8px;
+        border: 1px solid rgba(56, 189, 248, 0.25);
+        font-family: monospace;
+      }
+      .thinking-body {
+        padding: 8px 10px;
+        color: #cbd5e1;
+        line-height: 1.6;
+        font-size: 11.5px;
+        font-family: monospace;
+        background: #0f172a;
+        max-height: 220px;
+        overflow-y: auto;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+      .thinking-body::-webkit-scrollbar { width: 5px; }
+      .thinking-body::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+      .thinking-placeholder summary { cursor: default; }
+      .thinking-placeholder .thinking-summary-label { color: #94a3b8; }
+      .thinking-body-placeholder {
+        color: #64748b;
+        font-style: italic;
+        font-family: inherit;
+        font-size: 11px;
+        padding: 10px 12px;
+      }
+      .thinking-dots {
+        display: inline-flex;
+        gap: 3px;
+        align-items: center;
+      }
+      .thinking-dots .tdot {
+        width: 4px;
+        height: 4px;
+        background: #38bdf8;
+        border-radius: 50%;
+        animation: thinking-bounce 1s infinite;
+      }
+      .thinking-dots .tdot:nth-child(2) { animation-delay: 0.15s; }
+      .thinking-dots .tdot:nth-child(3) { animation-delay: 0.3s; }
+      @keyframes thinking-bounce {
+        0%, 80%, 100% { transform: translateY(0); opacity: 0.4; }
+        40% { transform: translateY(-3px); opacity: 1; }
       }
       .chat-input-area {
         padding: 12px 16px;
