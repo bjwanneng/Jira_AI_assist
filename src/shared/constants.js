@@ -55,6 +55,15 @@ export const LLM_TIMEOUT_MS = 60000;
 export const MAX_RERANK_CANDIDATES = 20;
 export const MAX_RERANKED_RESULTS = 5;
 export const RRF_K = 60;
+
+// Cross-ticket pattern analysis (cluster-analyzer) tuning.
+// Wide-recall retrieval pulls up to this many tickets; each is truncated and
+// fed to a single LLM call that groups them into thematic patterns.
+export const MAX_CLUSTER_CANDIDATES = 40;
+export const MAX_CLUSTER_PATTERNS = 7;
+export const CLUSTER_DESCRIPTION_TOKENS = 150;
+export const CLUSTER_COMMENT_TOKENS = 80;
+export const CLUSTER_MAX_COMMENTS = 3;
 // Bump when summarizer/expander prompt schema changes — invalidates cached
 // records with stale schemaVersion.
 export const SUMMARY_SCHEMA_VERSION = 1;

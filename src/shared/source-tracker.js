@@ -79,6 +79,17 @@ export function extractSources(toolName, args, result, jiraBaseUrl = '') {
       }
       break;
 
+    case 'analyze_ticket_patterns':
+      // Collect all tickets referenced across patterns. Dedup is handled by
+      // dedupeSources() later, but cap here to avoid an overwhelming number
+      // of source cards when a pattern references 20+ tickets.
+      for (const p of (result.patterns || [])) {
+        for (const t of (p.tickets || [])) {
+          addIssue(t.key, { title: t.detail || '', detail: p.name });
+        }
+      }
+      break;
+
     case 'search_confluence':
       for (const p of (result.pages || []).slice(0, 3)) {
         addPage(p.title, p.url, p.excerpt);

@@ -70,9 +70,19 @@ export const TOOLS = [
   },
   {
     name: 'find_similar_issues',
-    description: 'Find Jira issues similar to the current ticket by combining the ticket\'s IP/core hints and summary keywords. Use this when the user asks "find similar tickets", "related issues", or "anyone else hit this problem".',
+    description: 'Find Jira issues similar to the current ticket by combining the ticket\'s IP/core hints and summary keywords. Use this when the user asks "find similar tickets", "related issues", or "anyone else hit this problem". Returns top 5 similar tickets.',
     parameters: {
       issueKey: { type: 'string', description: 'Optional issue key. If omitted, uses the current conversation issue.' }
+    }
+  },
+  {
+    name: 'analyze_ticket_patterns',
+    description: 'Analyze a batch of Jira tickets (30-40) to identify common patterns, systemic issues, and recurring root causes across multiple tickets. Use this when the user asks about broad trends ("what common issues are in EHT P870 tickets?", "what patterns do you see in S5CSD timing tickets?", "summarize recurring problems"). This is a cross-ticket clustering analysis — NOT for finding a few specific similar tickets (use find_similar_issues for that). Returns 3-7 thematic patterns with affected tickets, quantitative evidence, root causes, and recommendations.',
+    parameters: {
+      issueKey: { type: 'string', description: 'Optional source ticket key. If provided, analyzes tickets related to this one.' },
+      query: { type: 'string', description: 'Optional free-form search query to gather tickets for analysis (e.g. "EHT P870 timing violations", "S5CSD SDC bugs"). Use this when there is no single source ticket.' },
+      project: { type: 'string', description: 'Optional project key to narrow the search scope, e.g. "S5CSD"' },
+      maxTickets: { type: 'number', description: 'Optional cap on tickets to analyze, default 40. Higher = broader patterns but slower.' }
     }
   },
   {
@@ -106,7 +116,7 @@ export function buildSystemPrompt(config = {}) {
   // to call them.
   const flags = config.sourceFlags || { jira: true, confluence: true, slack: true };
   const isToolEnabled = (name) => {
-    if (!flags.jira && ['get_issue', 'search_jira', 'find_similar_issues'].includes(name)) return false;
+    if (!flags.jira && ['get_issue', 'search_jira', 'find_similar_issues', 'analyze_ticket_patterns'].includes(name)) return false;
     if (!flags.confluence && ['search_confluence'].includes(name)) return false;
     if (!flags.slack && ['search_slack', 'read_slack_channel'].includes(name)) return false;
     return true;
@@ -140,6 +150,7 @@ How to use tools:
 - When the user asks to "summarize this ticket" but hasn't given a key, ask which one.
 - When you need to search Jira or Confluence, use the corresponding search tool. Pass natural language as \`query\`; the system auto-tokenizes and applies prefix wildcards. Don't convert to JQL yourself unless the user explicitly asked for JQL.
 - When the user asks about "similar tickets", "related issues", or "anyone else hit this", call \`find_similar_issues\`. It runs a cascade of Jira queries (same project + component, same project, cross-project) using OR-ed text tokens from the ticket's summary and IP hints — high recall by design.
+- When the user asks about BROAD TRENDS or RECURRING PATTERNS across many tickets — e.g. "what common issues appear in EHT P870 tickets?", "what patterns do you see in S5CSD timing bugs?", "summarize recurring problems in this project" — call \`analyze_ticket_patterns\`. It pulls 30-40 tickets and groups them into thematic patterns with root causes, quantitative evidence, and recommendations. Do NOT use it for "find tickets similar to this one" — that's \`find_similar_issues\`.
 - After loading context, you can call \`suggest_reply\` or \`summarize_context\` if helpful, or just answer directly.
 
 Before calling a tool, ALWAYS do a brief reasoning step first. Two ways to do this:

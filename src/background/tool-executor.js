@@ -1,10 +1,11 @@
 import { ApiClient, simplifyIssue, simplifySearchResults, simplifyConfluenceResults, SlackClient, simplifySlackMessages, simplifySlackFiles, DriveClient, simplifyDriveFiles } from './api-client.js';
 import { extractTextFromHtml, parseAtlassianUrl, detectIssueKey, truncateToTokens, buildJqlTextClause } from '../shared/utils.js';
 import { reciprocalRankFusion } from '../shared/rrf.js';
-import { MAX_RERANK_CANDIDATES, MAX_RERANKED_RESULTS, RRF_K } from '../shared/constants.js';
+import { MAX_RERANK_CANDIDATES, MAX_RERANKED_RESULTS, RRF_K, MAX_CLUSTER_CANDIDATES } from '../shared/constants.js';
 import { getOrSummarize } from './ticket-summarizer.js';
 import { getOrExpand } from './query-expander.js';
 import { rerankCandidates } from './reranker.js';
+import { analyzeTicketPatterns } from './cluster-analyzer.js';
 
 const STOP_WORDS = new Set([
   'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
@@ -112,6 +113,8 @@ export class ToolExecutor {
         return this.readDriveFile(args);
       case 'find_similar_issues':
         return this.findSimilarIssues(args);
+      case 'analyze_ticket_patterns':
+        return this.analyzeTicketPatterns(args);
       case 'set_context':
         return this.setContext(args);
       case 'summarize_context':
@@ -646,6 +649,98 @@ export class ToolExecutor {
       };
     } catch (err) {
       return { error: err.message };
+    }
+  }
+
+  /**
+   * Cross-ticket pattern analysis. Pulls a wide pool of related tickets (no
+   * rerank — we want breadth, not top-5 precision), then feeds them all to
+   * a single LLM call that groups them into thematic patterns with root
+   * causes, quantitative evidence, and recommendations.
+   *
+   * Two entry points:
+   *   - issueKey: pull tickets related to this one (same project + keywords).
+   *   - query: free-form search (e.g. "EHT P870 timing" or "S5CSD SDC bugs").
+   *
+   * @param {{ issueKey?: string, query?: string, project?: string, maxTickets?: number }} args
+   * @returns {Promise<{ patterns: Array, ticketCount: number, analyzedTickets: Array, error?: string }>}
+   */
+  async analyzeTicketPatterns(args) {
+    const issueKey = args?.issueKey || this.cache.get('currentIssue')?.key;
+    const query = args?.query;
+    const maxTickets = Math.min(args?.maxTickets || MAX_CLUSTER_CANDIDATES, MAX_CLUSTER_CANDIDATES);
+
+    if (!issueKey && !query) {
+      return { error: 'Provide either an issueKey or a query to analyze.' };
+    }
+
+    let issues = [];
+    let contextLabel = '';
+
+    try {
+      if (issueKey) {
+        // Wide recall from the source ticket — same path as find_similar_issues
+        // but with higher maxResults and no rerank.
+        let issue = this.cache.get(`rawIssue:${issueKey}`);
+        if (!issue) {
+          issue = await this.api.getIssue(issueKey);
+          this.cache.set(`rawIssue:${issueKey}`, issue);
+        }
+
+        const summary = this.llm ? await getOrSummarize(issue, this.llm) : null;
+        const result = await this.api.searchRelatedIssues(issue, {
+          summary,
+          maxResults: maxTickets,
+          issueCache: this.cache
+        });
+        issues = result.issues || [];
+        contextLabel = `tickets related to ${issueKey}`;
+      } else {
+        // Free-form query — use LLM expansion + wide JQL recall.
+        const expansion = this.llm ? await getOrExpand(query, this.llm) : null;
+        const filterClauses = [];
+        if (args?.project) filterClauses.push(`project = ${args.project.toUpperCase().replace(/[^A-Z0-9_]/gi, '')}`);
+
+        const terms = [
+          ...(expansion?.primaryTerms || []),
+          ...(expansion?.synonyms || [])
+        ];
+        const textClause = terms.length > 0
+          ? terms.map((t) => buildJqlTextClause(t)).join(' OR ')
+          : buildJqlTextClause(query);
+
+        const jql = `(${textClause})${filterClauses.length ? ' AND ' + filterClauses.join(' AND ') : ''} ORDER BY updated DESC`;
+        const result = await this.api.searchJira(jql, maxTickets);
+        issues = result.issues || [];
+        contextLabel = `tickets matching "${query}"`;
+      }
+
+      if (issues.length === 0) {
+        return {
+          patterns: [],
+          ticketCount: 0,
+          error: 'No tickets found for the given criteria.'
+        };
+      }
+
+      // Truncate to maxTickets (safety — Jira may return more than asked).
+      issues = issues.slice(0, maxTickets);
+
+      const analysis = await analyzeTicketPatterns(issues, this.llm, { contextLabel });
+
+      return {
+        patterns: analysis.patterns,
+        ticketCount: analysis.ticketCount,
+        analyzedTickets: issues.map((it) => ({
+          key: it.key,
+          summary: it.fields?.summary || '',
+          status: it.fields?.status?.name || '',
+          updated: it.fields?.updated
+        })),
+        error: analysis.error || undefined
+      };
+    } catch (err) {
+      return { error: err.message, patterns: [], ticketCount: 0 };
     }
   }
 

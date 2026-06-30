@@ -48,7 +48,7 @@ export class ChatOrchestrator {
    */
   isToolAllowed(toolName) {
     const f = this.sourceFlags;
-    if (!f.jira && ['get_issue', 'search_jira', 'find_similar_issues'].includes(toolName)) return false;
+    if (!f.jira && ['get_issue', 'search_jira', 'find_similar_issues', 'analyze_ticket_patterns'].includes(toolName)) return false;
     if (!f.confluence && ['search_confluence'].includes(toolName)) return false;
     if (!f.slack && ['search_slack', 'read_slack_channel'].includes(toolName)) return false;
     return true;
