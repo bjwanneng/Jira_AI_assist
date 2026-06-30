@@ -1,0 +1,5 @@
+/* Host elements are styled inside Shadow DOM. This file is reserved for any page-level overrides if needed. */
+#jira-ai-btn-host,
+#jira-ai-chat-host {
+  all: initial;
+}

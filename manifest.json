@@ -1,0 +1,75 @@
+{
+  "manifest_version": 3,
+  "name": "Jira AI Assistant",
+  "version": "1.0.0",
+  "description": "Open-source Rovo Chat alternative for Jira — hybrid search + LLM rerank. Connects Jira, Confluence, Slack, Drive. No backend.",
+  "permissions": [
+    "storage",
+    "unlimitedStorage",
+    "activeTab",
+    "scripting",
+    "identity"
+  ],
+  "optional_permissions": [
+    "background"
+  ],
+  "optional_host_permissions": [
+    "http://*/",
+    "https://*/"
+  ],
+  "oauth2": {
+    "client_id": "REPLACE_WITH_YOUR_GOOGLE_OAUTH_CLIENT_ID.apps.googleusercontent.com",
+    "scopes": [
+      "https://www.googleapis.com/auth/drive.metadata.readonly",
+      "https://www.googleapis.com/auth/drive.readonly",
+      "https://www.googleapis.com/auth/documents.readonly",
+      "https://www.googleapis.com/auth/spreadsheets.readonly"
+    ]
+  },
+  "host_permissions": [
+    "https://*.atlassian.net/*",
+    "https://*.jira.com/*",
+    "https://slack.com/*",
+    "https://*.slack.com/*",
+    "https://www.googleapis.com/*"
+  ],
+  "background": {
+    "service_worker": "src/background/service-worker.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://*.atlassian.net/browse/*",
+        "https://*.jira.com/browse/*",
+        "https://*.atlassian.net/jira/*",
+        "https://*.atlassian.net/projects/*",
+        "https://*.atlassian.net/issues/*",
+        "https://*.atlassian.net/secure/*",
+        "https://*.jira.com/jira/*",
+        "https://*.jira.com/projects/*",
+        "https://*.jira.com/issues/*",
+        "https://*.jira.com/secure/*"
+      ],
+      "js": ["src/content/content-script.js"],
+      "css": ["src/content/styles.css"],
+      "run_at": "document_idle",
+      "type": "module"
+    }
+  ],
+  "options_page": "src/options/options.html",
+  "action": {
+    "default_title": "Open Jira AI Assistant Chat"
+  },
+  "icons": {
+    "16": "src/assets/icons/icon16.png",
+    "48": "src/assets/icons/icon48.png",
+    "128": "src/assets/icons/icon128.png"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": ["src/assets/*"],
+      "matches": ["https://*.atlassian.net/*", "https://*.jira.com/*"]
+    }
+  ]
+}

@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Jira AI Assistant Settings</title>
+  <link rel="stylesheet" href="options.css">
+</head>
+<body>
+  <div class="container">
+    <h1>Jira AI Assistant Settings</h1>
+    <p class="subtitle">Configure your Jira, Confluence, and LLM credentials. All data is stored locally in the browser.</p>
+
+    <form id="settings-form">
+      <section>
+        <h2>Jira</h2>
+        <label>
+          Jira base URL
+          <input type="url" name="jiraBaseUrl" placeholder="https://your-domain.atlassian.net" required>
+        </label>
+        <label>
+          Email
+          <input type="email" name="jiraEmail" placeholder="you@example.com" required>
+        </label>
+        <label>
+          API token
+          <input type="password" name="jiraApiToken" placeholder="Create one at id.atlassian.com" required>
+          <span class="hint"><a href="https://id.atlassian.com/manage-profile/security/api-tokens" target="_blank">Create Atlassian API token</a>. Both classic and scoped tokens work. New tokens may end with <code>=XXXXXXXX</code> as an identifier — that's normal and does not mean the token is scoped.</span>
+        </label>
+        <label>
+          Cloud ID (leave blank for classic tokens)
+          <input type="text" name="jiraCloudId" placeholder="Only required if you created a scoped token">
+          <span class="hint">Leave <strong>blank</strong> for classic tokens (recommended). Only fill this if you explicitly created a "scoped" token at id.atlassian.com. Find it at <a href="https://admin.atlassian.com" target="_blank">admin.atlassian.com</a> → your org.</span>
+        </label>
+        <button type="button" id="test-jira" class="secondary">Test Jira Connection</button>
+        <span id="jira-status" class="status"></span>
+      </section>
+
+      <section>
+        <h2>Confluence</h2>
+        <label>
+          Confluence base URL (optional)
+          <input type="url" name="confluenceBaseUrl" placeholder="https://your-domain.atlassian.net/wiki">
+        </label>
+        <label>
+          API token (optional)
+          <input type="password" name="confluenceApiToken" placeholder="Same Atlassian token">
+          <span class="hint">Leave blank to reuse the Jira token.</span>
+        </label>
+      </section>
+
+      <section>
+        <h2>Slack</h2>
+        <label>
+          Slack token (optional)
+          <input type="password" name="slackToken" placeholder="xoxp-... or xoxb-...">
+          <span class="hint">
+            Create a token at <a href="https://api.slack.com/apps" target="_blank">api.slack.com/apps</a>
+            → Create New App → OAuth & Permissions → install to workspace.
+            Required scopes: <code>search:read</code>, <code>channels:history</code>, <code>groups:history</code>, <code>files:read</code>.
+            Free Slack workspaces only search the latest 10k messages.
+          </span>
+        </label>
+        <button type="button" id="test-slack" class="secondary">Test Slack Connection</button>
+        <span id="slack-status" class="status"></span>
+      </section>
+
+      <section>
+        <h2>Google Drive</h2>
+        <p class="hint" style="margin-bottom: 12px;">
+          Google Drive uses OAuth 2.0, not a static token. You need to set up a Google Cloud OAuth Client ID first:
+        </p>
+        <ol class="hint" style="margin-bottom: 16px; padding-left: 20px; line-height: 1.6;">
+          <li>Go to <a href="https://console.cloud.google.com/" target="_blank">console.cloud.google.com</a> → create or select a project.</li>
+          <li>APIs & Services → OAuth consent screen → External → add yourself as a test user.</li>
+          <li>APIs & Services → Library → enable <strong>Google Drive API</strong>, <strong>Google Docs API</strong>, <strong>Google Sheets API</strong>.</li>
+          <li>APIs & Services → Credentials → Create Credentials → OAuth Client ID → <strong>Application type: Chrome Extension</strong>.</li>
+          <li>Item ID: <code id="extension-id">...</code> (your extension ID — also find it on <code>chrome://extensions</code>). Replace if you load from a different folder.</li>
+          <li>Copy the <strong>Client ID</strong> (ends in <code>.apps.googleusercontent.com</code>) and paste it into <code>manifest.json</code> → <code>oauth2.client_id</code>.</li>
+          <li>Reload the extension.</li>
+        </ol>
+        <button type="button" id="connect-drive" class="secondary">Connect Google Drive</button>
+        <span id="drive-status" class="status"></span>
+      </section>
+
+      <section>
+        <h2>SiFive Document Library</h2>
+        <p class="hint" style="margin-bottom: 12px;">
+          Upload SiFive product user guides and manuals (PDFs, 250-600 pages).
+          Documents are parsed and indexed <strong>locally</strong> in your browser;
+          no PDF content is uploaded to any cloud service except the LLM endpoint
+          you configured for embeddings.
+        </p>
+        <p class="hint" style="margin-bottom: 12px;">
+          Each document is tagged by <strong>product</strong> (U74, E76, ...),
+          <strong>config</strong> (W3K, FA7, ...), and <strong>customer</strong> (general or company name).
+          The assistant auto-loads relevant docs based on the conversation context.
+        </p>
+        <label>
+          Embedding model (OpenAI-compatible)
+          <input type="text" name="embeddingModel" placeholder="text-embedding-3-small">
+          <span class="hint">Used when your LLM endpoint supports <code>/embeddings</code>. Defaults to <code>text-embedding-3-small</code> (1536 dim, ~$0.02 per 1M tokens).</span>
+        </label>
+      </section>
+
+      <section>
+        <h2>LLM</h2>
+        <label>
+          Base URL
+          <input type="url" name="llmBaseUrl" placeholder="https://api.openai.com/v1" required>
+          <span class="hint">OpenAI-compatible endpoint. Examples: <code>https://api.openai.com/v1</code>, <code>https://ark.cn-beijing.volces.com/api/v3</code>, <code>https://api.deepseek.com/v1</code>, <code>http://localhost:11434/v1</code> (Ollama). When you save or click "Test", Chrome will prompt to authorize the host if it isn't already a known service.</span>
+        </label>
+        <label>
+          API key
+          <input type="password" name="llmApiKey" placeholder="sk-..." required>
+        </label>
+        <label>
+          Model
+          <input type="text" name="llmModel" placeholder="gpt-4o" required>
+        </label>
+        <label>
+          Cheap model for search & rerank (optional)
+          <input type="text" name="llmCheapModel" placeholder="gpt-4o-mini">
+          <span class="hint">Used for ticket summarization, query expansion, and reranking — cheaper/faster than the main model. Falls back to the main model if blank.</span>
+        </label>
+        <div class="row">
+          <label>
+            Max tokens
+            <input type="number" name="llmMaxTokens" placeholder="0 = no limit" min="0" max="32768" value="0">
+            <span class="hint">0 = no limit (recommended, uses model default). Set a number only if you want to cap output length.</span>
+          </label>
+          <label>
+            Temperature
+            <input type="number" name="llmTemperature" placeholder="0.3" min="0" max="2" step="0.1" value="0.3">
+          </label>
+        </div>
+        <button type="button" id="test-llm" class="secondary">Test LLM Connection</button>
+        <span id="llm-status" class="status"></span>
+      </section>
+
+      <div class="actions">
+        <button type="submit" class="primary">Save Settings</button>
+        <span id="save-status" class="status"></span>
+      </div>
+    </form>
+  </div>
+  <script type="module" src="options.js"></script>
+</body>
+</html>

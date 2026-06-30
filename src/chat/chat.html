@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Jira AI Assistant</title>
+  <link rel="stylesheet" href="chat.css">
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <span class="logo">🤖</span>
+        <span class="brand-text">Jira AI</span>
+      </div>
+
+      <button id="new-chat" class="new-chat-btn">+ New conversation</button>
+
+      <nav class="sidebar-nav">
+        <a href="../options/options.html" target="_blank" class="nav-item" title="Open settings">
+          <span class="nav-icon">⚙</span>
+          <span>Settings</span>
+        </a>
+      </nav>
+
+      <div class="history-section">
+        <div class="history-header">
+          <span>History</span>
+          <button id="clear-history" class="history-clear" title="Delete all conversations">🗑</button>
+        </div>
+        <div id="history-list" class="history-list">
+          <p class="history-empty">No conversations yet.</p>
+        </div>
+      </div>
+
+      <div class="sidebar-footer">
+        <div id="context-sidebar" class="context-sidebar">
+          <div class="context-label">Current context</div>
+          <div id="context-display" class="context-display">No context</div>
+          <button id="context-clear" class="context-btn" title="Clear context">Clear</button>
+        </div>
+      </div>
+    </aside>
+
+    <main class="chat-main">
+      <div class="chat-header">
+        <h1 id="current-title">New conversation</h1>
+      </div>
+      <div id="messages" class="messages"></div>
+      <div id="loading" class="loading-hidden">
+        <div class="loading-card">
+          <div class="spinner"></div>
+          <span id="loading-text">Thinking...</span>
+        </div>
+      </div>
+    </main>
+
+    <footer class="chat-input-area">
+      <div class="source-bar">
+        <div class="source-group">
+          <span class="source-label">Sources:</span>
+          <label class="source-chip"><input type="checkbox" id="src-jira" checked> Jira</label>
+          <label class="source-chip"><input type="checkbox" id="src-confluence" checked> Confluence</label>
+          <label class="source-chip"><input type="checkbox" id="src-slack" checked> Slack</label>
+        </div>
+      </div>
+      <div class="input-hints">
+        <span>Try:</span>
+        <button class="chip" data-prompt="Summarize ticket PROJ-123">Summarize ticket</button>
+        <button class="chip" data-prompt="Search Confluence for deployment guide">Search Confluence</button>
+        <button class="chip" data-prompt="Search Slack messages about BEU interrupt">Search Slack</button>
+        <button class="chip" data-prompt="Draft a reply to the customer in English">Draft reply</button>
+      </div>
+      <div class="input-row">
+        <textarea id="input" rows="1" placeholder="Ask anything. Paste a Jira issue key, Confluence URL, or any web link..."></textarea>
+        <button id="send" title="Send">➤</button>
+      </div>
+    </footer>
+  </div>
+  <script type="module" src="chat.js"></script>
+</body>
+</html>

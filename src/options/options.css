@@ -1,0 +1,143 @@
+* {
+  box-sizing: border-box;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+  background: #f4f5f7;
+  color: #172b4d;
+  margin: 0;
+  padding: 40px 20px;
+}
+
+.container {
+  max-width: 720px;
+  margin: 0 auto;
+  background: #fff;
+  padding: 32px;
+  border-radius: 8px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+}
+
+h1 {
+  margin-top: 0;
+  font-size: 24px;
+}
+
+.subtitle {
+  color: #5e6c84;
+  margin-bottom: 24px;
+}
+
+section {
+  margin-bottom: 32px;
+  padding-bottom: 24px;
+  border-bottom: 1px solid #dfe1e6;
+}
+
+h2 {
+  font-size: 18px;
+  margin-bottom: 16px;
+}
+
+label {
+  display: block;
+  margin-bottom: 16px;
+  font-weight: 500;
+  font-size: 14px;
+}
+
+input {
+  display: block;
+  width: 100%;
+  margin-top: 6px;
+  padding: 10px 12px;
+  font-size: 14px;
+  border: 1px solid #dfe1e6;
+  border-radius: 4px;
+}
+
+input:focus {
+  outline: none;
+  border-color: #4c9aff;
+  box-shadow: 0 0 0 2px rgba(76, 154, 255, 0.25);
+}
+
+.hint {
+  display: block;
+  margin-top: 4px;
+  font-size: 12px;
+  font-weight: 400;
+  color: #5e6c84;
+}
+
+.row {
+  display: flex;
+  gap: 16px;
+}
+
+.row label {
+  flex: 1;
+}
+
+.actions {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+button {
+  padding: 10px 16px;
+  font-size: 14px;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  font-weight: 500;
+}
+
+button.primary {
+  background: #0052cc;
+  color: #fff;
+}
+
+button.primary:hover {
+  background: #0747a6;
+}
+
+button.secondary {
+  background: #f4f5f7;
+  color: #172b4d;
+  border: 1px solid #dfe1e6;
+}
+
+button.secondary:hover {
+  background: #e9eaf0;
+}
+
+.status {
+  font-size: 13px;
+  min-height: 18px;
+}
+
+.status.success {
+  color: #006644;
+}
+
+.status.error {
+  color: #de350b;
+}
+
+.primary-link {
+  display: inline-block;
+  background: #0052cc;
+  color: #fff;
+  padding: 10px 16px;
+  border-radius: 4px;
+  font-size: 14px;
+  font-weight: 500;
+  text-decoration: none;
+}
+
+.primary-link:hover {
+  background: #0747a6;
+}
