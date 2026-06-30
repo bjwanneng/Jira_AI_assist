@@ -542,6 +542,33 @@ export class ToolExecutor {
     const maxResults = (typeof args === 'object' ? args?.maxResults : null) || 5;
 
     if (!query) return { error: 'Missing query parameter' };
+
+    // Try LLM-expanded hybrid search: pass the query through query-expander
+    // to get primaryTerms + synonyms, then search both title and body of
+    // Confluence pages. Falls back to the legacy single `text ~` search when
+    // LLM is unavailable or expansion is empty.
+    if (this.llm) {
+      try {
+        const expansion = await getOrExpand(query, this.llm);
+        const terms = [
+          ...(expansion?.primaryTerms || []),
+          ...(expansion?.synonyms || [])
+        ].filter((t) => t && t.length >= 2);
+        if (terms.length > 0) {
+          const result = await this.api.searchConfluenceHybrid(terms, maxResults, space);
+          return {
+            query,
+            space: space || null,
+            pages: simplifyConfluenceResults(result),
+            expanded: true,
+            terms
+          };
+        }
+      } catch (err) {
+        console.warn('[search_confluence] hybrid search failed, falling back:', err.message);
+      }
+    }
+
     const result = await this.api.searchConfluence(query, maxResults, space);
     return {
       query,

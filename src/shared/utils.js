@@ -140,6 +140,30 @@ export function buildJqlTextClause(term) {
 }
 
 /**
+ * Build a CQL text-match clause that searches BOTH title and body.
+ *
+ * Confluence's CQL exposes `title ~` and `text ~` as separate fields.
+ * Searching both gives higher recall than `text ~` alone, and title matches
+ * are inherently more precise (a page titled "TRNG Physical Implementation"
+ * is a stronger hit than one that mentions TRNG in passing).
+ *
+ * Single-word terms get a prefix wildcard (`title ~ "auth*"` matches
+ * "authentication", "authorize"). Multi-word terms get an exact phrase match.
+ *
+ * @param {string} term
+ * @returns {string} — `(title ~ "..." OR text ~ "...")`
+ */
+export function buildCqlTextClause(term) {
+  const s = String(term || '');
+  const escaped = s.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  if (/\s/.test(s)) {
+    const phrase = `"\\"${escaped}\\""`;
+    return `(title ~ ${phrase} OR text ~ ${phrase})`;
+  }
+  return `(title ~ "${escaped}*" OR text ~ "${escaped}*")`;
+}
+
+/**
  * Validate that a URL string is safe to use as an HTML href.
  * Only http: and https: protocols are allowed.
  * @param {string} url

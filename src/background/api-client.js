@@ -1,5 +1,5 @@
 import { JIRA_FIELDS, MAX_RELATED_ISSUES, MAX_CONFLUENCE_RESULTS, ATLASSIAN_API_BASE, MAX_RERANK_CANDIDATES, RRF_K } from '../shared/constants.js';
-import { extractDescriptionText, extractCommentText, formatIssue, formatComment, quoteJql, buildJqlTextClause } from '../shared/utils.js';
+import { extractDescriptionText, extractCommentText, formatIssue, formatComment, quoteJql, buildJqlTextClause, buildCqlTextClause } from '../shared/utils.js';
 import { IssueExtractor } from '../content/issue-extractor.js';
 import { reciprocalRankFusion } from '../shared/rrf.js';
 
@@ -163,6 +163,37 @@ export class ApiClient {
     if (!this.config.confluenceBaseUrl && !this.isScopedMode) return { results: [] };
 
     const parts = [`text ~ ${quoteJql(query)}`, `type = page`];
+    if (space) {
+      parts.push(`space = ${quoteJql(space.toUpperCase())}`);
+    }
+    const cql = parts.join(' AND ') + ' ORDER BY lastModified DESC';
+    const url = `${this.confluenceApiBase}/wiki/rest/api/search?cql=${encodeURIComponent(cql)}&limit=${maxResults}&expand=content.body.view`;
+    const res = await fetch(url, { headers: this.confluenceHeaders });
+    if (!res.ok) throw new Error(`Confluence search failed: ${res.status} ${res.statusText}`);
+    return res.json();
+  }
+
+  /**
+   * Hybrid Confluence search using LLM-expanded terms.
+   *
+   * Mirrors the Jira hybrid pipeline: each term searches BOTH title and text
+   * (title matches rank higher in Confluence's relevance scoring), OR-ed
+   * together for wide recall. Falls back to the simple `text ~` search when
+   * no expansion is provided.
+   *
+   * @param {string[]} terms - primaryTerms + synonyms from query-expander
+   * @param {number} maxResults
+   * @param {string|null} space
+   * @returns {Promise<object>} raw Confluence search response
+   */
+  async searchConfluenceHybrid(terms, maxResults = MAX_CONFLUENCE_RESULTS, space = null) {
+    if (!this.config.confluenceBaseUrl && !this.isScopedMode) return { results: [] };
+    if (!Array.isArray(terms) || terms.length === 0) {
+      return { results: [] };
+    }
+
+    const textOr = terms.map((t) => buildCqlTextClause(t)).join(' OR ');
+    const parts = [`(${textOr})`, `type = page`];
     if (space) {
       parts.push(`space = ${quoteJql(space.toUpperCase())}`);
     }
