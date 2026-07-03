@@ -80,6 +80,25 @@ export function escapeHtml(text) {
 }
 
 /**
+ * Coerce a possible error value (string, Error, plain object from the
+ * background worker, etc.) into a display string. Prevents "[object Object]"
+ * when an error response is a structured object without a usable `message`.
+ * @param {any} candidate
+ * @param {string} fallback
+ * @returns {string}
+ */
+export function normalizeErrMsg(candidate, fallback = 'Unknown error') {
+  if (candidate == null) return fallback;
+  if (typeof candidate === 'string') return candidate || fallback;
+  if (candidate instanceof Error) return candidate.message || fallback;
+  if (typeof candidate === 'object') {
+    if (typeof candidate.message === 'string' && candidate.message) return candidate.message;
+    try { return JSON.stringify(candidate); } catch { return fallback; }
+  }
+  return String(candidate) || fallback;
+}
+
+/**
  * Format a Jira issue into a compact text summary.
  * @param {object} issue
  * @returns {string}

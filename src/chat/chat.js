@@ -1,5 +1,5 @@
 import { MESSAGE_TYPES } from '../shared/message-types.js';
-import { escapeHtml } from '../shared/utils.js';
+import { escapeHtml, normalizeErrMsg } from '../shared/utils.js';
 import { renderMarkdown } from '../shared/markdown.js';
 import { ContextState } from '../shared/context-state.js';
 import {
@@ -23,6 +23,15 @@ const currentTitle = document.getElementById('current-title');
 const srcJira = document.getElementById('src-jira');
 const srcConfluence = document.getElementById('src-confluence');
 const srcSlack = document.getElementById('src-slack');
+
+const weeklyBtn = document.getElementById('weekly-summary-btn');
+const weeklyView = document.getElementById('weekly-view');
+const weeklyBack = document.getElementById('weekly-back');
+const weeklyGenerate = document.getElementById('weekly-generate');
+const weeklyCopy = document.getElementById('weekly-copy');
+const weeklyOutput = document.getElementById('weekly-output');
+const messagesContainer = document.getElementById('messages');
+const loadingContainer = document.getElementById('loading');
 
 const contextState = new ContextState('global');
 
@@ -277,7 +286,7 @@ async function onSend() {
       renderHistory();
     } else {
       const errObj = response?.error || {};
-      const errMsg = errObj.message || response?.error || 'Unknown error';
+      const errMsg = normalizeErrMsg(errObj.message || response?.error, 'Unknown error');
       if (errObj.code === 'HOST_PERMISSION_MISSING' || isHostPermissionError(errMsg)) {
         const url = errObj.llmBaseUrl || extractUrlFromPermissionError(errMsg);
         addHostPermissionError(errMsg, url);
@@ -288,13 +297,14 @@ async function onSend() {
       }
     }
   } catch (err) {
-    if (err?.code === 'HOST_PERMISSION_MISSING' || isHostPermissionError(err?.message)) {
-      const url = err?.llmBaseUrl || extractUrlFromPermissionError(err?.message);
-      addHostPermissionError(err.message, url);
-      await appendMessage(activeConversationId, { role: 'error', content: err.message });
+    const errMsg = normalizeErrMsg(err?.message ?? err, 'Failed to reach background service.');
+    if (err?.code === 'HOST_PERMISSION_MISSING' || isHostPermissionError(errMsg)) {
+      const url = err?.llmBaseUrl || extractUrlFromPermissionError(errMsg);
+      addHostPermissionError(errMsg, url);
+      await appendMessage(activeConversationId, { role: 'error', content: errMsg });
     } else {
-      addErrorMessage(err.message || 'Failed to reach background service.');
-      await appendMessage(activeConversationId, { role: 'error', content: err.message });
+      addErrorMessage(errMsg);
+      await appendMessage(activeConversationId, { role: 'error', content: errMsg });
     }
   } finally {
     // Safety net: if the placeholder never got replaced by a real thinking
@@ -557,6 +567,77 @@ clearHistoryBtn.addEventListener('click', async () => {
   refreshContextDisplay();
   renderHistory();
 });
+
+// ---------- Weekly Summary ----------
+
+weeklyBtn.addEventListener('click', () => {
+  messagesContainer.classList.add('hidden');
+  loadingContainer.classList.add('loading-hidden');
+  weeklyView.classList.remove('hidden');
+  currentTitle.textContent = 'Weekly Summary';
+});
+
+weeklyBack.addEventListener('click', async () => {
+  weeklyView.classList.add('hidden');
+  messagesContainer.classList.remove('hidden');
+  if (activeConversationId) {
+    const conv = await getConversation(activeConversationId);
+    currentTitle.textContent = conv?.title || 'Conversation';
+  } else {
+    currentTitle.textContent = 'New conversation';
+  }
+});
+
+weeklyGenerate.addEventListener('click', async () => {
+  weeklyGenerate.disabled = true;
+  weeklyCopy.disabled = true;
+  weeklyOutput.innerHTML = '<div class="loading-card"><div class="spinner"></div><span>Loading open tickets and summarizing...</span></div>';
+
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: MESSAGE_TYPES.WEEKLY_SUMMARY,
+      payload: {}
+    });
+    if (response?.success) {
+      renderWeeklyReport(response.data);
+      weeklyCopy.disabled = false;
+    } else {
+      const errMsg = normalizeErrMsg(response?.error?.message || response?.error, 'Failed to generate weekly summary.');
+      weeklyOutput.innerHTML = `<div class="weekly-error">⚠️ ${escapeHtml(errMsg)}</div>`;
+    }
+  } catch (err) {
+    const errMsg = normalizeErrMsg(err?.message ?? err, 'Failed to reach background service.');
+    weeklyOutput.innerHTML = `<div class="weekly-error">⚠️ ${escapeHtml(errMsg)}</div>`;
+  } finally {
+    weeklyGenerate.disabled = false;
+  }
+});
+
+weeklyCopy.addEventListener('click', async () => {
+  const md = weeklyOutput.dataset.markdown;
+  if (!md) return;
+  try {
+    await navigator.clipboard.writeText(md);
+    const prev = weeklyCopy.textContent;
+    weeklyCopy.textContent = 'Copied ✓';
+    setTimeout(() => { weeklyCopy.textContent = prev; }, 1500);
+  } catch {
+    weeklyCopy.textContent = 'Copy failed';
+    setTimeout(() => { weeklyCopy.textContent = 'Copy as Markdown'; }, 1500);
+  }
+});
+
+function renderWeeklyReport(data) {
+  if (!data) {
+    weeklyOutput.innerHTML = '<p class="weekly-empty">No data returned.</p>';
+    return;
+  }
+  const warningsHtml = (data.warnings && data.warnings.length)
+    ? `<div class="weekly-warnings">${data.warnings.map(w => `<div>⚠ ${escapeHtml(w)}</div>`).join('')}</div>`
+    : '';
+  weeklyOutput.dataset.markdown = data.markdown || '';
+  weeklyOutput.innerHTML = warningsHtml + '<div class="weekly-markdown">' + renderMarkdown(data.markdown || '') + '</div>';
+}
 
 // ---------- Init ----------
 

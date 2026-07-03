@@ -1,5 +1,5 @@
 import { MESSAGE_TYPES } from '../shared/message-types.js';
-import { escapeHtml } from '../shared/utils.js';
+import { escapeHtml, normalizeErrMsg } from '../shared/utils.js';
 import { renderMarkdown } from '../shared/markdown.js';
 import { requestHostPermission, isHostPermissionError, extractUrlFromPermissionError } from '../shared/permissions.js';
 
@@ -164,7 +164,7 @@ export class ChatUI {
         this.renderResponse(response.data, placeholder);
       } else {
         const errObj = response.error || {};
-        const errMsg = errObj.message || response.error || 'Unknown error';
+        const errMsg = normalizeErrMsg(errObj.message || response.error, 'Unknown error');
         if (errObj.code === 'HOST_PERMISSION_MISSING' || isHostPermissionError(errMsg)) {
           const url = errObj.llmBaseUrl || extractUrlFromPermissionError(errMsg);
           this.addHostPermissionError(errMsg, url);
@@ -173,11 +173,12 @@ export class ChatUI {
         }
       }
     } catch (err) {
-      if (err?.code === 'HOST_PERMISSION_MISSING' || isHostPermissionError(err?.message)) {
-        const url = err?.llmBaseUrl || extractUrlFromPermissionError(err?.message);
-        this.addHostPermissionError(err.message, url);
+      const errMsg = normalizeErrMsg(err?.message ?? err, 'Failed to reach background service.');
+      if (err?.code === 'HOST_PERMISSION_MISSING' || isHostPermissionError(errMsg)) {
+        const url = err?.llmBaseUrl || extractUrlFromPermissionError(errMsg);
+        this.addHostPermissionError(errMsg, url);
       } else {
-        this.addErrorMessage(err.message || 'Failed to reach background service.');
+        this.addErrorMessage(errMsg);
       }
     } finally {
       if (placeholder && placeholder.isConnected) placeholder.remove();
