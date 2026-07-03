@@ -3,6 +3,7 @@ import { STORAGE_KEYS, DEFAULT_SETTINGS } from '../shared/constants.js';
 import { ChatOrchestrator } from './chat-orchestrator.js';
 import { LlmClient } from './llm-client.js';
 import { ApiClient, SlackClient } from './api-client.js';
+import { buildWeeklySummary } from './weekly-summary-builder.js';
 
 const allKeys = Object.values(STORAGE_KEYS);
 
@@ -212,6 +213,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         case MESSAGE_TYPES.GET_SETTINGS: {
           const stored = await chrome.storage.local.get(allKeys);
           return sendResponse({ success: true, data: { ...DEFAULT_SETTINGS, ...stored } });
+        }
+
+        case MESSAGE_TYPES.WEEKLY_SUMMARY: {
+          const config = await loadConfig();
+          if (!config.jiraBaseUrl || !config.jiraApiToken) {
+            return sendResponse({ success: false, error: { message: 'Jira not configured. Open extension settings.' } });
+          }
+          if (!config.llmBaseUrl || !config.llmApiKey) {
+            return sendResponse({ success: false, error: { message: 'LLM not configured. Open extension settings.' } });
+          }
+          const data = await buildWeeklySummary(config);
+          return sendResponse({ success: true, data });
         }
 
         default:

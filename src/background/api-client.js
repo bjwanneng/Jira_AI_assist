@@ -159,6 +159,80 @@ export class ApiClient {
     throw new Error(`All Jira search endpoints failed:\n${errors.join('\n')}`);
   }
 
+  /**
+   * Discover the custom field id for "Organizations" (Jira Service Management).
+   * Returns the id (e.g. "customfield_10002") or null if not found. Cached
+   * on the instance to avoid repeated /field calls.
+   */
+  async findOrganizationsFieldId() {
+    if (this._orgFieldCache !== undefined) return this._orgFieldCache;
+    try {
+      const res = await fetch(`${this.jiraApiBase}/rest/api/3/field`, { headers: this.jiraHeaders });
+      if (!res.ok) { this._orgFieldCache = null; return null; }
+      const fields = await res.json();
+      const orgField = (fields || []).find(
+        f => f.name && /organization/i.test(f.name) && /^customfield_/.test(f.id)
+      );
+      this._orgFieldCache = orgField?.id || null;
+    } catch {
+      this._orgFieldCache = null;
+    }
+    return this._orgFieldCache;
+  }
+
+  /**
+   * Search issues assigned to the current user with the given statuses,
+   * returning full issue records including Organizations (if available).
+   * @param {string[]} statuses  e.g. ['Waiting for Customer', 'Waiting for Support']
+   * @param {number} maxResults
+   * @returns {Promise<object[]>} raw issue array
+   */
+  async searchMyOpenIssues(statuses, maxResults = 100) {
+    const orgFieldId = await this.findOrganizationsFieldId();
+    const fields = ['summary', 'status', 'issuetype', 'priority', 'created', 'updated',
+      'comment', 'description', 'reporter', 'labels', 'components'];
+    if (orgFieldId) fields.push(orgFieldId);
+
+    const statusList = statuses.map(s => `"${s.replace(/"/g, '\\"')}"`).join(', ');
+    const jql = `assignee = currentUser() AND status in (${statusList}) ORDER BY updated DESC`;
+
+    // Use searchJira but override fields to include our extras. Reuse the
+    // endpoint cascade by calling the same logic inline.
+    const attempts = [
+      {
+        method: 'POST',
+        url: `${this.jiraApiBase}/rest/api/3/search/jql`,
+        body: { jql, fields, maxResults },
+      },
+      {
+        method: 'POST',
+        url: `${this.jiraApiBase}/rest/api/3/search`,
+        body: { jql, fields, maxResults },
+      },
+      {
+        method: 'GET',
+        url: `${this.jiraApiBase}/rest/api/2/search?jql=${encodeURIComponent(jql)}&fields=${fields.join(',')}&maxResults=${maxResults}`,
+        body: null,
+      }
+    ];
+    for (const attempt of attempts) {
+      try {
+        const res = await fetch(attempt.url, {
+          method: attempt.method,
+          headers: this.jiraHeaders,
+          body: attempt.body ? JSON.stringify(attempt.body) : undefined
+        });
+        if (res.status === 404 || res.status === 405 || res.status === 410) continue;
+        if (!res.ok) continue;
+        const data = await res.json();
+        return data.issues || data.values || [];
+      } catch {
+        continue;
+      }
+    }
+    throw new Error('All Jira search endpoints failed while fetching open issues.');
+  }
+
   async searchConfluence(query, maxResults = MAX_CONFLUENCE_RESULTS, space = null) {
     if (!this.config.confluenceBaseUrl && !this.isScopedMode) return { results: [] };
 

@@ -17,6 +17,10 @@
       <button id="new-chat" class="new-chat-btn">+ New conversation</button>
 
       <nav class="sidebar-nav">
+        <button id="weekly-summary-btn" class="nav-item" title="Generate weekly summary report">
+          <span class="nav-icon">📋</span>
+          <span>Weekly Summary</span>
+        </button>
         <a href="../options/options.html" target="_blank" class="nav-item" title="Open settings">
           <span class="nav-icon">⚙</span>
           <span>Settings</span>
@@ -51,6 +55,16 @@
         <div class="loading-card">
           <div class="spinner"></div>
           <span id="loading-text">Thinking...</span>
+        </div>
+      </div>
+      <div id="weekly-view" class="weekly-view hidden">
+        <div class="weekly-toolbar">
+          <button id="weekly-back" class="weekly-back" title="Back to chat">← Back</button>
+          <button id="weekly-generate" class="weekly-generate">Generate</button>
+          <button id="weekly-copy" class="weekly-copy" disabled>Copy as Markdown</button>
+        </div>
+        <div id="weekly-output" class="weekly-output">
+          <p class="weekly-empty">Click <strong>Generate</strong> to build this week's summary from your open tickets.</p>
         </div>
       </div>
     </main>
