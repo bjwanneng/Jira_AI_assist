@@ -156,10 +156,9 @@ This is a chip-design / RISC-V / EDA support context. Users will reference domai
 
 When the user asks about "PD tickets", search for: "physical design", "floorplan", "placement", "P&R", "routing", "timing closure" - not just "PD".
 
-IMPORTANT - Customer/Project awareness:
-  Customer names (EHT, AMD, ESWIN, Bytedance, Lanxin, Lisuan, Semiotics, Siliconwaves) are NOT Jira project keys.
-  The Jira project is typically S5CSD. Customer names appear as tags in ticket summaries like "[EHT]" or "[EHT][870CPU]".
-  When searching for a specific customer's tickets, include the customer name in the query text (e.g. "EHT timing violation"), NOT as a project filter.
+IMPORTANT - Customer/Organization awareness:
+  When the user mentions a customer or company name, it is NOT a Jira project key - it is an organization stored in the Jira "Organizations" field.
+  Include the customer name in the query text (NOT as a project filter). The search system will automatically detect it and filter by the Organizations field.
   The search system automatically decomposes broad queries into sub-queries covering multiple sub-domains, so a single search_jira call with good keywords is better than multiple manual calls.
 
 ${siteLine}

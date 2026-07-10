@@ -47,12 +47,11 @@ Domain abbreviations:
   MMIO = Memory-Mapped I/O
   SoC = System on Chip
 
-Customer names (NOT project keys): EHT, AMD, ESWIN, Bytedance, Lanxin, Lisuan, Semiotics, Siliconwaves.
-When the query mentions a customer name, include it in primaryTerms so Jira's text search matches the [EHT] or [Customer] tag in ticket summaries.
+The query may mention a customer or organization name (any company/entity name, e.g. an abbreviation used as a customer identifier). If present, extract it into mandatoryTerms — it will be used to filter by the Jira "Organizations" field. Do NOT hardcode specific customer names; detect them generically from the query text.
 
 Return ONLY a JSON object (no prose, no markdown fence):
 {
-  "mandatoryTerms": ["customer or entity names that MUST appear in every result, e.g. 'EHT'"],
+  "mandatoryTerms": ["customer/entity names extracted from the query, e.g. any company or org name the user mentioned"],
   "subQueries": [
     {
       "focus": "short label for this sub-domain, e.g. 'timing' or 'SDC'",
@@ -63,8 +62,8 @@ Return ONLY a JSON object (no prose, no markdown fence):
 }
 
 Rules:
-- mandatoryTerms: extract customer/entity names (EHT, AMD, ESWIN, etc.) from the query. These become AND filters so every result MUST contain them. Leave empty if no customer name is present.
-- Produce 1-6 sub-queries depending on query breadth. A narrow query ("BEU interrupt") = 1 sub-query. A broad query ("EHT PD tickets") = 4-6 sub-queries covering distinct sub-domains.
+- mandatoryTerms: if the query mentions a specific customer/company/org name, extract it here. These become AND filters applied to the Organizations field. Leave empty if no customer name is present. Do NOT put technical terms here.
+- Produce 1-6 sub-queries depending on query breadth. A narrow query ("BEU interrupt") = 1 sub-query. A broad query ("PD tickets") = 4-6 sub-queries covering distinct sub-domains.
 - Each term 2-32 chars. Skip stop words.
 - Do NOT put customer names in sub-query primaryTerms - put them ONLY in mandatoryTerms.
 - Do NOT duplicate the same term across many sub-queries - each sub-query should have distinct keywords.`;

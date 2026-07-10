@@ -23,12 +23,7 @@ import { parseLlmJson } from '../shared/llm-json.js';
 
 const OPEN_STATUSES = ['Waiting for Customer', 'Waiting for Support'];
 
-// Fixed org display order. Tickets whose org isn't in this list fall into
-// "Misc" at the end.
-const ORG_ORDER = [
-  'Bytedance', 'AMD', 'EHT', 'ESWIN', 'Lanxin', 'Lisuan',
-  'Semiotics', 'Siliconwaves'
-];
+// Orgs are sorted alphabetically at render time (no hardcoded order).
 const MISC_ORG = 'Misc';
 
 const MAX_COMMENTS_PER_TICKET = 5;
@@ -126,13 +121,12 @@ function pickOrgName(orgFieldValue) {
 }
 
 function orderOrgs(seenOrgs) {
-  const seen = new Set(seenOrgs);
-  const ordered = ORG_ORDER.filter(o => seen.has(o));
-  const extras = Array.from(seen).filter(o => !ORG_ORDER.includes(o)).sort();
-  if (seen.has(MISC_ORG)) {
-    return [...ordered, ...extras.filter(o => o !== MISC_ORG), MISC_ORG];
+  // Sort alphabetically; keep "Misc" at the end.
+  const sorted = Array.from(seenOrgs).filter(o => o !== MISC_ORG).sort();
+  if (new Set(seenOrgs).has(MISC_ORG)) {
+    return [...sorted, MISC_ORG];
   }
-  return [...ordered, ...extras];
+  return sorted;
 }
 
 /**
