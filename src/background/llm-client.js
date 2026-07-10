@@ -161,12 +161,30 @@ export class LlmClient {
       }
 
       // Providers may return more vectors than requested (trim those).
-      // If they return FEWER, that's a provider bug - silently duplicating
-      // via modular arithmetic would poison the index with identical vectors.
+      // If they return FEWER, retry one-by-one (some providers like Ark
+      // multimodal only support single-input despite accepting arrays).
+      if (vectors.length < input.length && input.length > 1) {
+        console.warn(`[embed] Provider returned ${vectors.length}/${input.length} vectors, falling back to sequential embed`);
+        const seqVectors = [];
+        for (const singleInput of input) {
+          const seqRes = await fetch(this.embeddingsUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${this.embedApiKey}` },
+            body: JSON.stringify({ model: this.embedModel, input: [singleInput], encoding_format: 'float' })
+          });
+          if (!seqRes.ok) { seqVectors.push(null); continue; }
+          const seqData = await seqRes.json();
+          let seqArr = Array.isArray(seqData?.data) ? seqData.data : (seqData?.data?.embedding ? [{ embedding: seqData.data.embedding }] : []);
+          const seqVec = seqArr.map((d) => toVector(d?.embedding)).filter(Array.isArray);
+          seqVectors.push(seqVec[0] || null);
+        }
+        const valid = seqVectors.filter(Array.isArray);
+        if (valid.length > 0) return seqVectors;
+        throw new Error('Sequential embed fallback also failed.');
+      }
       if (vectors.length < input.length) {
         throw new Error(
           `Embedding API returned ${vectors.length} vectors for ${input.length} input texts. ` +
-          'This is likely a provider bug. Refusing to duplicate vectors to avoid index corruption. ' +
           'Raw response: ' + JSON.stringify(data).slice(0, 600)
         );
       }
