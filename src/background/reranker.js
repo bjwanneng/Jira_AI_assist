@@ -112,10 +112,11 @@ function buildScoreMap(parsed) {
  */
 export async function rerankCandidates(source, candidates, llm, opts = {}) {
   const topN = opts.topN ?? MAX_RERANKED_RESULTS;
-  // Cap the rerank pool to keep the LLM prompt manageable. 50 candidates
-  // × ~30 tokens each (key + summary + status) ≈ 1.5k tokens, well within
-  // budget for a single cheap-model call.
-  const RERANK_POOL_CAP = 50;
+  // Cap the rerank pool to keep the LLM prompt manageable. Each candidate
+  // uses ~50 tokens (key + summary + status). With a 4096 token limit on
+  // cheap models, 40 candidates ≈ 2k tokens for candidates + 1k for prompt
+  // template + source context = ~3k, leaving headroom.
+  const RERANK_POOL_CAP = 30;
   const pool = (candidates || []).slice(0, Math.min(RERANK_POOL_CAP, candidates.length));
 
   // Nothing to rerank — return as-is (sorted by RRF score, no reasons).
@@ -169,7 +170,8 @@ export async function rerankCandidates(source, candidates, llm, opts = {}) {
     scored.sort((a, b) => b.score - a.score || (b._rrfScore || 0) - (a._rrfScore || 0));
     return scored.slice(0, topN);
   } catch (err) {
-    console.warn('[reranker] LLM call failed, falling back to RRF order:', err.message);
+    console.warn('[reranker] LLM call failed (pool=%d), falling back to RRF order: %s', pool.length, err?.message || err);
+    console.warn('[reranker] error details:', err?.status, err?.code, JSON.stringify(err).slice(0, 200));
     return pool
       .slice()
       .sort((a, b) => (b._rrfScore || 0) - (a._rrfScore || 0))
