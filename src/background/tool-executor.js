@@ -422,48 +422,70 @@ export class ToolExecutor {
       };
     }
 
-    // Build hard filters: project, status, issueType.
-    // Customer names (mandatoryTerms) are NOT hard-filtered because many tickets
-    // lack the [EHT] tag in summary — a strict AND would exclude them. Instead
-    // we run TWO JQL variants per sub-query: one WITH the customer AND filter
-    // (high precision), one WITHOUT (high recall). RRF fusion naturally boosts
-    // tickets that appear in both lists.
+    // Build customer filter using the Jira "Organizations" field (Jira Service
+    // Management). Customer names like "EHT" are stored in this custom field,
+    // NOT in ticket text — so text search for "EHT" misses most tickets.
+    // If the field is found, we use ` Organizations in ("EHT")` for precise
+    // filtering. We also keep a text-search fallback for safety.
     const mandatoryTerms = Array.isArray(expansion.mandatoryTerms) ? expansion.mandatoryTerms.filter(t => t && t.length >= 2) : [];
     const baseFilterClauses = [];
     if (project) baseFilterClauses.push(`project = ${project.toUpperCase().replace(/[^A-Z0-9_]/gi, '')}`);
     if (status) baseFilterClauses.push(`status = "${String(status).replace(/"/g, '\\"')}"`);
     if (issueType) baseFilterClauses.push(`issuetype = "${String(issueType).replace(/"/g, '\\"')}"`);
-    const mandatoryClause = mandatoryTerms.length
-      ? ' AND ' + mandatoryTerms.map((t) => buildJqlTextClause(t)).join(' AND ')
-      : '';
     const baseFilterStr = baseFilterClauses.length ? ' AND ' + baseFilterClauses.join(' AND ') : '';
 
-    // Build JQL channels: for each sub-query, run 2 variants (with/without
-    // customer filter) × 2 term lists (primaryTerms + synonyms) = up to 4
-    // channels per sub-query. This maximizes recall while still preferring
-    // customer-tagged tickets via RRF boost.
+    // Try to discover the Organizations field id (cached on the API client).
+    let orgFieldId = null;
+    let orgFilterClause = '';
+    if (mandatoryTerms.length > 0) {
+      try {
+        orgFieldId = await this.api.findOrganizationsFieldId();
+      } catch { /* field discovery may fail, fall back to text search */ }
+      if (orgFieldId) {
+        // JQL: "Organizations" in ("EHT") OR cf["customfield_xxxx"] in ("EHT")
+        const orgNames = mandatoryTerms.map((t) => `"${t.replace(/"/g, '')}"`).join(', ');
+        orgFilterClause = ` AND "${orgFieldId}" in (${orgNames})`;
+      }
+    }
+    // Text-search fallback for customer name (used when org field is unavailable,
+    // or as variant B for high recall alongside the org-field variant A)
+    const textMandatoryClause = mandatoryTerms.length
+      ? ' AND ' + mandatoryTerms.map((t) => buildJqlTextClause(t)).join(' AND ')
+      : '';
+
+    console.log('[search_jira] orgFieldId=%s mandatoryTerms=%s', orgFieldId, mandatoryTerms.join(','));
+
+    // Build JQL channels with three customer-matching strategies:
+    //   tier 1/2: Organizations field match (most precise — catches all EHT
+    //             tickets even without [EHT] in summary)
+    //   tier 3/4: text search for customer name (catches tickets where the
+    //             customer name IS in the text but org field isn't set)
+    //   tier 5/6: no customer filter at all (highest recall — catches tickets
+    //             where customer association is only inferred)
     const subQueries = expansion.subQueries;
     const channels = [];
     for (let si = 0; si < subQueries.length; si++) {
       const sq = subQueries[si];
-      // Variant A: with customer AND filter (high precision, tier 1/2)
-      if (sq.primaryTerms?.length) {
-        const textOr = sq.primaryTerms.map((t) => buildJqlTextClause(t)).join(' OR ');
-        channels.push({ tier: 1, jql: `(${textOr})${mandatoryClause}${baseFilterStr} ORDER BY updated DESC` });
+      const primaryOr = sq.primaryTerms?.length
+        ? `(${sq.primaryTerms.map((t) => buildJqlTextClause(t)).join(' OR ')})`
+        : null;
+      const synonymOr = sq.synonyms?.length
+        ? `(${sq.synonyms.map((t) => buildJqlTextClause(t)).join(' OR ')})`
+        : null;
+
+      // Variant A: Organizations field filter (tier 1/2) — best precision
+      if (orgFilterClause) {
+        if (primaryOr) channels.push({ tier: 1, jql: `${primaryOr}${orgFilterClause}${baseFilterStr} ORDER BY updated DESC` });
+        if (synonymOr) channels.push({ tier: 2, jql: `${synonymOr}${orgFilterClause}${baseFilterStr} ORDER BY updated DESC` });
       }
-      if (sq.synonyms?.length) {
-        const textOr = sq.synonyms.map((t) => buildJqlTextClause(t)).join(' OR ');
-        channels.push({ tier: 2, jql: `(${textOr})${mandatoryClause}${baseFilterStr} ORDER BY updated DESC` });
+      // Variant B: text-search for customer name (tier 3/4)
+      if (textMandatoryClause) {
+        if (primaryOr) channels.push({ tier: 3, jql: `${primaryOr}${textMandatoryClause}${baseFilterStr} ORDER BY updated DESC` });
+        if (synonymOr) channels.push({ tier: 4, jql: `${synonymOr}${textMandatoryClause}${baseFilterStr} ORDER BY updated DESC` });
       }
-      // Variant B: without customer filter (high recall, tier 3/4)
-      if (sq.primaryTerms?.length) {
-        const textOr = sq.primaryTerms.map((t) => buildJqlTextClause(t)).join(' OR ');
-        channels.push({ tier: 3, jql: `(${textOr})${baseFilterStr} ORDER BY updated DESC` });
-      }
-      if (sq.synonyms?.length) {
-        const textOr = sq.synonyms.map((t) => buildJqlTextClause(t)).join(' OR ');
-        channels.push({ tier: 4, jql: `(${textOr})${baseFilterStr} ORDER BY updated DESC` });
-      }
+      // Variant C: no customer filter (tier 5/6) — highest recall
+      if (primaryOr) channels.push({ tier: 5, jql: `${primaryOr}${baseFilterStr} ORDER BY updated DESC` });
+      if (synonymOr) channels.push({ tier: 6, jql: `${synonymOr}${baseFilterStr} ORDER BY updated DESC` });
     }
 
     if (channels.length === 0) {
