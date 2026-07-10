@@ -100,7 +100,7 @@ export const INDEX_PAGE_SIZE = 100; // JQL page size when bulk-loading
 export const INDEX_JQL_LOWER_BOUND = '2000-01-01'; // updated >= this date
 export const EMBED_TEXT_MAX_CHARS = 4000; // chars of ticket text sent to embed()
 export const VECTOR_TOP_K = 50; // candidates pulled from the vector channel
-export const VECTOR_MIN_SCORE = 0.20; // cosine threshold for vector recall (lowered for broad coverage)
+export const VECTOR_MIN_SCORE = 0.10; // cosine threshold for vector recall (low for broad semantic coverage)
 // Vector is the PRIMARY recall channel. If it returns fewer than this many
 // neighbours we consider it too weak to stand on its own and fall back to (or
 // fuse with) the legacy JQL/keyword channel.
