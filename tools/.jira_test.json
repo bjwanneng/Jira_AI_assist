@@ -1,0 +1,8 @@
+{
+  "jiraBaseUrl": "https://sifive.atlassian.net",
+  "jiraEmail": "wanneng.zhang@sifive.com",
+  "jiraApiToken": "ATATT3xFfGF0a41k39MWx4r3GyQOAbTxLMNXIGAOFDrH2yyHdcZhouE_zZGGUTUm-HfSqqesej4bBEC65mHndLxWiGu3z3tdfGJ7NFm1eRfrJvBa34trkN3zfghbHfauCgxDOnjXUTbbjEkfy065ZsN_GZHqPrERmfMUxCvXcm7zR829G8ahnJw",
+  "embedBaseUrl": "https://ark.cn-beijing.volces.com/api/v3",
+  "embedApiKey": "ceb618d2-0806-4699-b759-d3e3901ca7ca",
+  "embedModel": "doubao-embedding-text-240715"
+}
