@@ -455,52 +455,42 @@ export class ToolExecutor {
 
     console.log('[search_jira] orgFieldId=%s mandatoryTerms=%s', orgFieldId, mandatoryTerms.join(','));
 
-    // Build JQL channels with three customer-matching strategies:
-    //   tier 1/2: Organizations field match (most precise — catches all EHT
-    //             tickets even without [EHT] in summary)
-    //   tier 3/4: text search for customer name (catches tickets where the
-    //             customer name IS in the text but org field isn't set)
-    //   tier 5/6: no customer filter at all (highest recall — catches tickets
-    //             where customer association is only inferred)
+    // Build JQL channels with three customer-matching strategies.
+    // To avoid hitting Jira API rate limits, we combine primaryTerms + synonyms
+    // into a single OR list per sub-query (instead of separate channels).
+    // This halves the channel count while maintaining the same coverage.
     //
     // Sort order: alternate between `updated DESC` and `created DESC` across
-    // channels so we capture BOTH recent tickets AND older ones. Using only
-    // `updated DESC` biases toward recently-touched tickets, causing older
-    // but important tickets (e.g. PD implementation from months ago) to be
-    // truncated by the Jira API's maxResults cap.
+    // channels so we capture BOTH recent tickets AND older ones.
     const SORT_ORDERS = ['updated DESC', 'created DESC'];
     const subQueries = expansion.subQueries;
     const channels = [];
     let sortIdx = 0;
-    for (let si = 0; si < subQueries.length; si++) {
-      const sq = subQueries[si];
-      const primaryOr = sq.primaryTerms?.length
-        ? `(${sq.primaryTerms.map((t) => buildJqlTextClause(t)).join(' OR ')})`
-        : null;
-      const synonymOr = sq.synonyms?.length
-        ? `(${sq.synonyms.map((t) => buildJqlTextClause(t)).join(' OR ')})`
-        : null;
+    for (const sq of subQueries) {
+      // Merge primaryTerms + synonyms into one OR list for this sub-query
+      const allTerms = [...(sq.primaryTerms || []), ...(sq.synonyms || [])];
+      if (allTerms.length === 0) continue;
+      const termOr = `(${allTerms.map((t) => buildJqlTextClause(t)).join(' OR ')})`;
 
-      // Helper: push a channel with alternating sort order
-      const push = (tier, jqlBase) => {
+      const push = (tier) => {
         const sort = SORT_ORDERS[sortIdx % SORT_ORDERS.length];
         sortIdx++;
-        channels.push({ tier, jql: `${jqlBase} ORDER BY ${sort}` });
+        return { tier, sort };
       };
 
-      // Variant A: Organizations field filter (tier 1/2) — best precision
+      // Variant A: Organizations field filter (tier 1) — best precision
       if (orgFilterClause) {
-        if (primaryOr) push(1, `${primaryOr}${orgFilterClause}${baseFilterStr}`);
-        if (synonymOr) push(2, `${synonymOr}${orgFilterClause}${baseFilterStr}`);
+        const s = push(1);
+        channels.push({ tier: s.tier, jql: `${termOr}${orgFilterClause}${baseFilterStr} ORDER BY ${s.sort}` });
       }
-      // Variant B: text-search for customer name (tier 3/4)
+      // Variant B: text-search for customer name (tier 2)
       if (textMandatoryClause) {
-        if (primaryOr) push(3, `${primaryOr}${textMandatoryClause}${baseFilterStr}`);
-        if (synonymOr) push(4, `${synonymOr}${textMandatoryClause}${baseFilterStr}`);
+        const s = push(2);
+        channels.push({ tier: s.tier, jql: `${termOr}${textMandatoryClause}${baseFilterStr} ORDER BY ${s.sort}` });
       }
-      // Variant C: no customer filter (tier 5/6) — highest recall
-      if (primaryOr) push(5, `${primaryOr}${baseFilterStr}`);
-      if (synonymOr) push(6, `${synonymOr}${baseFilterStr}`);
+      // Variant C: no customer filter (tier 3) — highest recall
+      const s = push(3);
+      channels.push({ tier: s.tier, jql: `${termOr}${baseFilterStr} ORDER BY ${s.sort}` });
     }
 
     if (channels.length === 0) {
