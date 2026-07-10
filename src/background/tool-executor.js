@@ -387,7 +387,7 @@ export class ToolExecutor {
     const project = typeof args === 'object' ? args?.project : null;
     const status = typeof args === 'object' ? args?.status : null;
     const issueType = typeof args === 'object' ? args?.issueType : null;
-    const maxResults = (typeof args === 'object' ? args?.maxResults : null) || 20;
+    const maxResults = (typeof args === 'object' ? args?.maxResults : null) || 50;
 
     if (!query) return { error: 'Missing query parameter' };
 
@@ -462,8 +462,16 @@ export class ToolExecutor {
     //             customer name IS in the text but org field isn't set)
     //   tier 5/6: no customer filter at all (highest recall — catches tickets
     //             where customer association is only inferred)
+    //
+    // Sort order: alternate between `updated DESC` and `created DESC` across
+    // channels so we capture BOTH recent tickets AND older ones. Using only
+    // `updated DESC` biases toward recently-touched tickets, causing older
+    // but important tickets (e.g. PD implementation from months ago) to be
+    // truncated by the Jira API's maxResults cap.
+    const SORT_ORDERS = ['updated DESC', 'created DESC'];
     const subQueries = expansion.subQueries;
     const channels = [];
+    let sortIdx = 0;
     for (let si = 0; si < subQueries.length; si++) {
       const sq = subQueries[si];
       const primaryOr = sq.primaryTerms?.length
@@ -473,19 +481,26 @@ export class ToolExecutor {
         ? `(${sq.synonyms.map((t) => buildJqlTextClause(t)).join(' OR ')})`
         : null;
 
+      // Helper: push a channel with alternating sort order
+      const push = (tier, jqlBase) => {
+        const sort = SORT_ORDERS[sortIdx % SORT_ORDERS.length];
+        sortIdx++;
+        channels.push({ tier, jql: `${jqlBase} ORDER BY ${sort}` });
+      };
+
       // Variant A: Organizations field filter (tier 1/2) — best precision
       if (orgFilterClause) {
-        if (primaryOr) channels.push({ tier: 1, jql: `${primaryOr}${orgFilterClause}${baseFilterStr} ORDER BY updated DESC` });
-        if (synonymOr) channels.push({ tier: 2, jql: `${synonymOr}${orgFilterClause}${baseFilterStr} ORDER BY updated DESC` });
+        if (primaryOr) push(1, `${primaryOr}${orgFilterClause}${baseFilterStr}`);
+        if (synonymOr) push(2, `${synonymOr}${orgFilterClause}${baseFilterStr}`);
       }
       // Variant B: text-search for customer name (tier 3/4)
       if (textMandatoryClause) {
-        if (primaryOr) channels.push({ tier: 3, jql: `${primaryOr}${textMandatoryClause}${baseFilterStr} ORDER BY updated DESC` });
-        if (synonymOr) channels.push({ tier: 4, jql: `${synonymOr}${textMandatoryClause}${baseFilterStr} ORDER BY updated DESC` });
+        if (primaryOr) push(3, `${primaryOr}${textMandatoryClause}${baseFilterStr}`);
+        if (synonymOr) push(4, `${synonymOr}${textMandatoryClause}${baseFilterStr}`);
       }
       // Variant C: no customer filter (tier 5/6) — highest recall
-      if (primaryOr) channels.push({ tier: 5, jql: `${primaryOr}${baseFilterStr} ORDER BY updated DESC` });
-      if (synonymOr) channels.push({ tier: 6, jql: `${synonymOr}${baseFilterStr} ORDER BY updated DESC` });
+      if (primaryOr) push(5, `${primaryOr}${baseFilterStr}`);
+      if (synonymOr) push(6, `${synonymOr}${baseFilterStr}`);
     }
 
     if (channels.length === 0) {
