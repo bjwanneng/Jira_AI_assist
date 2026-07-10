@@ -403,10 +403,6 @@ export class ToolExecutor {
       };
     }
 
-    // Try LLM-expanded hybrid retrieval: Channel A (primaryTerms, BM25-precise)
-    // + Channel B (synonyms, semantic-approx), merged with RRF and reranked.
-    // Falls back to the legacy single-channel fuzzy JQL when LLM is unavailable
-    // or expansion fails.
     const expansion = this.llm ? await getOrExpand(query, this.llm) : null;
 
     if (!expansion || !expansion.subQueries?.length) {
@@ -422,69 +418,187 @@ export class ToolExecutor {
       };
     }
 
-    // Build customer filter using the Jira "Organizations" field (Jira Service
-    // Management). Customer names like "EHT" are stored in this custom field,
-    // NOT in ticket text — so text search for "EHT" misses most tickets.
-    // If the field is found, we use ` Organizations in ("EHT")` for precise
-    // filtering. We also keep a text-search fallback for safety.
     const mandatoryTerms = Array.isArray(expansion.mandatoryTerms) ? expansion.mandatoryTerms.filter(t => t && t.length >= 2) : [];
-    const baseFilterClauses = [];
-    // Default time range: last 5 years. Jira Cloud requires bounded JQL,
-    // and this ensures we capture historical PD tickets from 2025+.
     const fiveYearsAgo = new Date(Date.now() - 5 * 365 * 86400000).toISOString().slice(0, 10);
-    baseFilterClauses.push(`updated >= "${fiveYearsAgo}"`);
+
+    // Discover Organizations field for customer filtering
+    let orgFieldId = null;
+    if (mandatoryTerms.length > 0) {
+      try { orgFieldId = await this.api.findOrganizationsFieldId(); } catch { /* ignore */ }
+    }
+
+    const vectorEnabled = Boolean(this.llm?.isEmbeddingEnabled);
+    const vectorCount = vectorEnabled ? await indexCount() : 0;
+
+    // ============================================================
+    // TWO-PHASE SEARCH (preferred when org field is available)
+    //
+    // Phase 1: Structured fetch — pull ALL tickets for this org+project,
+    //          with NO keyword filtering. This guarantees 100% recall:
+    //          even tickets whose summary has no PD keywords are included.
+    //
+    // Phase 2: Semantic rerank — embed the query + sub-queries, compute
+    //          cosine similarity against the Phase 1 pool (using the local
+    //          vector index), then LLM-rerank the top candidates.
+    //
+    // This eliminates the fundamental problem: keyword search misses tickets
+    // whose text doesn't contain the expected terms.
+    // ============================================================
+    if (orgFieldId && mandatoryTerms.length > 0) {
+      console.log('[search_jira] TWO-PHASE: org=%s project=%s mandatoryTerms=%s', orgFieldId, project || '(all)', mandatoryTerms.join(','));
+
+      // Phase 1: fetch the full ticket pool for this org (no keyword filter)
+      const phase1Clauses = [
+        `updated >= "${fiveYearsAgo}"`,
+        `"${orgFieldId}" in (${mandatoryTerms.map(t => `"${t.replace(/"/g, '')}"`).join(',')})`
+      ];
+      if (project) phase1Clauses.push(`project = ${project.toUpperCase().replace(/[^A-Z0-9_]/gi, '')}`);
+      if (status) phase1Clauses.push(`status = "${String(status).replace(/"/g, '\\"')}"`);
+      if (issueType) phase1Clauses.push(`issuetype = "${String(issueType).replace(/"/g, '\\"')}"`);
+      const phase1Jql = phase1Clauses.join(' AND ') + ' ORDER BY updated DESC';
+
+      const t0 = Date.now();
+      const phase1Res = await this.api.searchJira(phase1Jql, 200); // cap at 200
+      const pool = phase1Res.issues || [];
+      console.log('[search_jira] Phase 1: %d tickets fetched in %dms', pool.length, Date.now() - t0);
+
+      if (pool.length === 0) {
+        return {
+          query, jql: phase1Jql, issues: [], total: 0,
+          reranked: false, reason: 'org_pool_empty',
+          searchMode: 'two-phase', orgFieldId
+        };
+      }
+
+      // Phase 2a: if vector index exists, filter pool by vector similarity
+      let candidates = pool;
+      let vectorHits = 0;
+
+      if (vectorEnabled && vectorCount > 0) {
+        const t1 = Date.now();
+        const vecQueries = [
+          query,
+          ...expansion.subQueries.map((sq) => {
+            const terms = [...(sq.primaryTerms || []), ...(sq.synonyms || [])];
+            return terms.length > 0 ? terms.join(' ') : query;
+          })
+        ];
+        try {
+          const vecs = await this.llm.embed(vecQueries);
+          const poolKeys = new Set(pool.map(it => it.key));
+          const bestByKey = new Map();
+
+          for (const vec of vecs) {
+            if (!Array.isArray(vec) || vec.length === 0) continue;
+            const hits = await vectorSearch(vec, { topK: VECTOR_TOP_K * 3, queryModel: this.llm.embedModel });
+            for (const h of hits) {
+              // Only keep hits that are in the Phase 1 pool
+              if (poolKeys.has(h.key)) {
+                const existing = bestByKey.get(h.key);
+                if (!existing || h.score > existing.score) {
+                  bestByKey.set(h.key, h);
+                }
+              }
+            }
+          }
+
+          // Build a "vector score" lookup for boosting during rerank
+          const vecScoreByKey = new Map();
+          for (const [key, h] of bestByKey) {
+            vecScoreByKey.set(key, h.score);
+          }
+          vectorHits = vecScoreByKey.size;
+          console.log('[search_jira] Phase 2a: %d pool tickets have vector match in %dms', vectorHits, Date.now() - t1);
+
+          // Attach vector scores to pool items for reranker context
+          candidates = pool.map(it => ({
+            ...it,
+            _vecScore: vecScoreByKey.get(it.key) || 0
+          }));
+        } catch (vecErr) {
+          console.warn('[search_jira] vector search failed, using full pool:', vecErr.message);
+          candidates = pool;
+        }
+      }
+
+      // Phase 2b: LLM rerank — pick the most relevant tickets from the pool
+      const t2 = Date.now();
+      const simplifiedPool = simplifySearchResults({ issues: candidates });
+      const ranked = await rerankCandidates(
+        { query, expansion },
+        candidates.map((it, idx) => ({
+          key: it.key,
+          fields: {
+            summary: it.fields?.summary || simplifiedPool[idx]?.summary || '',
+            status: it.fields?.status,
+            issuetype: it.fields?.issuetype,
+            priority: it.fields?.priority,
+            updated: it.fields?.updated
+          },
+          _vecScore: it._vecScore || 0
+        })),
+        this.llm,
+        { topN: Math.min(maxResults, candidates.length) }
+      );
+      console.log('[search_jira] Phase 2b: reranked %d -> %d in %dms', candidates.length, ranked.length, Date.now() - t2);
+
+      const fieldByKey = new Map(candidates.map((it) => [it.key, it]));
+      const simplified = ranked.map((r) => {
+        const src = fieldByKey.get(r.key) || { fields: {} };
+        const f = src.fields || {};
+        return {
+          key: r.key,
+          summary: f.summary || '',
+          status: f.status?.name || '',
+          issueType: f.issuetype?.name || '',
+          priority: f.priority?.name || '',
+          updated: f.updated,
+          score: r.score,
+          reason: r.reason
+        };
+      });
+
+      return {
+        query,
+        jql: `(two-phase: ${pool.length} from org pool)`,
+        issues: simplified,
+        total: pool.length,
+        candidatesBeforeRerank: candidates.length,
+        reranked: Boolean(this.llm),
+        searchMode: 'two-phase',
+        orgFieldId,
+        poolSize: pool.length,
+        vectorHits,
+        vectorEnabled,
+        vectorIndexCount: vectorCount,
+        subQueryCount: expansion.subQueries.length,
+        totalTime: Date.now() - t0
+      };
+    }
+
+    // ============================================================
+    // FALLBACK: Keyword-based multi-channel search (when no org field)
+    // Uses JQL text search with multi-sub-query decomposition.
+    // ============================================================
+    const baseFilterClauses = [`updated >= "${fiveYearsAgo}"`];
     if (project) baseFilterClauses.push(`project = ${project.toUpperCase().replace(/[^A-Z0-9_]/gi, '')}`);
     if (status) baseFilterClauses.push(`status = "${String(status).replace(/"/g, '\\"')}"`);
     if (issueType) baseFilterClauses.push(`issuetype = "${String(issueType).replace(/"/g, '\\"')}"`);
     const baseFilterStr = baseFilterClauses.length ? ' AND ' + baseFilterClauses.join(' AND ') : '';
 
-    // Try to discover the Organizations field id (cached on the API client).
-    let orgFieldId = null;
-    let orgFilterClause = '';
-    if (mandatoryTerms.length > 0) {
-      try {
-        orgFieldId = await this.api.findOrganizationsFieldId();
-      } catch { /* field discovery may fail, fall back to text search */ }
-      if (orgFieldId) {
-        // JQL: "Organizations" in ("EHT") OR cf["customfield_xxxx"] in ("EHT")
-        const orgNames = mandatoryTerms.map((t) => `"${t.replace(/"/g, '')}"`).join(', ');
-        orgFilterClause = ` AND "${orgFieldId}" in (${orgNames})`;
-      }
-    }
-    // Text-search fallback for customer name (used when org field is unavailable,
-    // or as variant B for high recall alongside the org-field variant A)
     const textMandatoryClause = mandatoryTerms.length
       ? ' AND ' + mandatoryTerms.map((t) => buildJqlTextClause(t)).join(' AND ')
       : '';
 
-    console.log('[search_jira] orgFieldId=%s mandatoryTerms=%s', orgFieldId, mandatoryTerms.join(','));
+    console.log('[search_jira] KEYWORD MODE: mandatoryTerms=%s', mandatoryTerms.join(','));
 
-    // Build JQL channels with three customer-matching strategies.
-    // To avoid hitting Jira API rate limits, we combine primaryTerms + synonyms
-    // into a single OR list per sub-query (instead of separate channels).
-    // This halves the channel count while maintaining the same coverage.
-    //
-    // Sort order: alternate between `updated DESC` (recently active tickets)
-    // and `created ASC` (oldest tickets first). Using `created ASC` is critical:
-    // `created DESC` returns newest-created tickets first, which are still 2026
-    // tickets — it does NOT surface 2025 tickets. `created ASC` puts the oldest
-    // matching tickets at the top of the maxResults window, ensuring historical
-    // coverage. RRF fusion then balances recent + historical results.
     const SORT_ORDERS = ['updated DESC', 'created ASC'];
     const subQueries = expansion.subQueries;
     const channels = [];
     let sortIdx = 0;
-    // Cap sub-queries to avoid generating too many parallel JQL channels.
-    // Each sub-query generates up to 3 channels (org-field + text-filter +
-    // no-filter). With Jira Cloud's rate limits, >15 parallel calls risks 429s.
     const MAX_CHANNELS = 15;
     for (const sq of subQueries) {
-      if (channels.length >= MAX_CHANNELS) {
-        console.log('[search_jira] hit MAX_CHANNELS=%d, skipping remaining sub-queries', MAX_CHANNELS);
-        break;
-      }
-      // Merge primaryTerms + synonyms into one OR list, cap at 8 terms to keep
-      // JQL manageable (each term adds ~30 chars to the query)
+      if (channels.length >= MAX_CHANNELS) break;
       const allTerms = [...(sq.primaryTerms || []), ...(sq.synonyms || [])].slice(0, 8);
       if (allTerms.length === 0) continue;
       const termOr = `(${allTerms.map((t) => buildJqlTextClause(t)).join(' OR ')})`;
@@ -495,18 +609,11 @@ export class ToolExecutor {
         return { tier, sort };
       };
 
-      // Variant A: Organizations field filter (tier 1) — best precision
-      if (orgFilterClause) {
-        const s = push(1);
-        channels.push({ tier: s.tier, jql: `${termOr}${orgFilterClause}${baseFilterStr} ORDER BY ${s.sort}` });
-      }
-      // Variant B: text-search for customer name (tier 2)
       if (textMandatoryClause) {
-        const s = push(2);
+        const s = push(1);
         channels.push({ tier: s.tier, jql: `${termOr}${textMandatoryClause}${baseFilterStr} ORDER BY ${s.sort}` });
       }
-      // Variant C: no customer filter (tier 3) — highest recall
-      const s = push(3);
+      const s = push(2);
       channels.push({ tier: s.tier, jql: `${termOr}${baseFilterStr} ORDER BY ${s.sort}` });
     }
 
@@ -514,72 +621,37 @@ export class ToolExecutor {
       const jql = buildFuzzyJql(query, { project, status, issueType });
       const result = await this.api.searchJira(jql, maxResults);
       return {
-        query,
-        jql,
+        query, jql,
         issues: simplifySearchResults(result),
-        total: result.total,
-        endpoint: result._endpoint,
-        reranked: false
+        total: result.total, endpoint: result._endpoint,
+        reranked: false, searchMode: 'fuzzy'
       };
     }
 
-    // Vector search: embed EACH sub-query separately and run cosine search.
-    // This is critical for coverage: "EHT PD tickets" as a single embed is too
-    // generic to match specific tickets about "setup violation" or "SDC
-    // constraint". But embedding "EHT timing STA setup hold violation" and
-    // "EHT SDC constraint create_clock false_path" separately produces vectors
-    // that match the right domain-specific tickets in the index.
-    //
-    // We also embed the original query for a broad semantic sweep.
-    // All vector searches run in parallel with JQL channels.
-    const vectorEnabled = Boolean(this.llm?.isEmbeddingEnabled);
-    const vectorCount = vectorEnabled ? await indexCount() : 0;
-    const shouldRunVector = vectorEnabled && vectorCount > 0;
-
-    console.log('[search_jira] query=%s subQueries=%d channels=%d vector=%s', query, subQueries.length, channels.length, shouldRunVector);
+    console.log('[search_jira] keyword channels=%d vector=%s', channels.length, vectorEnabled && vectorCount > 0);
 
     const allTasks = channels.map(async (c) => {
-        const res = await this.api.searchJira(c.jql, MAX_RERANK_CANDIDATES);
-        return { tier: c.tier, issues: res.issues || [] };
-      });
+      const res = await this.api.searchJira(c.jql, MAX_RERANK_CANDIDATES);
+      return { tier: c.tier, issues: res.issues || [] };
+    });
 
+    const shouldRunVector = vectorEnabled && vectorCount > 0;
     if (shouldRunVector) {
-      // Build one vector-search query text per sub-query (primaryTerms + synonyms joined),
-      // plus the original user query. Each gets its own embed + cosine search.
-      // Batch the embeds for efficiency.
-      const vecQueries = [
-        query, // original user query (broad semantic sweep)
-        ...subQueries.map((sq) => {
-          const terms = [...(sq.primaryTerms || []), ...(sq.synonyms || [])];
-          return terms.length > 0 ? terms.join(' ') : query;
-        })
-      ];
-
+      const vecQueries = [query, ...subQueries.map((sq) => {
+        const terms = [...(sq.primaryTerms || []), ...(sq.synonyms || [])];
+        return terms.length > 0 ? terms.join(' ') : query;
+      })];
       allTasks.push((async () => {
-        // Batch embed all sub-query texts in one API call
         const vecs = await this.llm.embed(vecQueries);
-        const vecResults = await Promise.all(
-          vecs.map(async (vec, idx) => {
-            if (!Array.isArray(vec) || vec.length === 0) return [];
-            const hits = await vectorSearch(vec, {
-              topK: VECTOR_TOP_K,
-              queryModel: this.llm.embedModel
-            });
-            return hits;
-          })
-        );
-
-        // Merge all vector hits, dedup by key (keep highest score)
         const bestByKey = new Map();
-        for (const hits of vecResults) {
+        for (const vec of vecs) {
+          if (!Array.isArray(vec) || vec.length === 0) continue;
+          const hits = await vectorSearch(vec, { topK: VECTOR_TOP_K, queryModel: this.llm.embedModel });
           for (const h of hits) {
             const existing = bestByKey.get(h.key);
-            if (!existing || h.score > existing.score) {
-              bestByKey.set(h.key, h);
-            }
+            if (!existing || h.score > existing.score) bestByKey.set(h.key, h);
           }
         }
-
         return {
           tier: 0,
           issues: Array.from(bestByKey.values()).map((h) => ({
@@ -613,40 +685,28 @@ export class ToolExecutor {
       }
     }
 
-    console.log('[search_jira] retrieval done: jqlHits=%d vecHits=%d rankedLists=%d', totalJqlHits, vectorRecall, rankedLists.length);
+    console.log('[search_jira] keyword retrieval: jqlHits=%d vecHits=%d', totalJqlHits, vectorRecall);
 
     if (rankedLists.length === 0) {
       return {
-        query,
-        jql: channels.map((c) => c.jql).join(' | '),
-        issues: [],
-        total: 0,
-        reranked: false,
-        reason: 'all_channels_empty',
-        subQueryCount: subQueries.length,
-        vectorEnabled,
-        vectorIndexCount: vectorCount,
-        vectorRecall
+        query, jql: channels.map((c) => c.jql).join(' | '),
+        issues: [], total: 0,
+        reranked: false, reason: 'all_channels_empty',
+        searchMode: 'keyword',
+        vectorEnabled, vectorIndexCount: vectorCount, vectorRecall
       };
     }
 
-    // RRF merge -> top candidates.
     const fused = reciprocalRankFusion(rankedLists, { k: RRF_K, keyFn: (it) => it.key });
     const candidates = fused.map((entry) => ({
-      ...entry.item,
-      _rrfScore: entry.score,
+      ...entry.item, _rrfScore: entry.score,
       _tier: tierByKey.get(entry.item.key) ?? 99
     })).slice(0, MAX_RERANK_CANDIDATES);
 
-    console.log('[search_jira] RRF fused: %d unique candidates, reranking top %d...', candidates.length, Math.min(MAX_RERANKED_RESULTS, maxResults));
+    console.log('[search_jira] RRF: %d candidates, reranking top %d...', candidates.length, Math.min(maxResults, candidates.length));
 
-    // Rerank with LLM. Use maxResults directly (not MAX_RERANKED_RESULTS) so
-    // the caller controls how many results they get. The reranker scores all
-    // candidates, then we take the top-N.
     const ranked = await rerankCandidates(
-      { query, expansion },
-      candidates,
-      this.llm,
+      { query, expansion }, candidates, this.llm,
       { topN: Math.min(maxResults, candidates.length) }
     );
 
@@ -655,31 +715,22 @@ export class ToolExecutor {
       const src = fieldByKey.get(r.key) || { fields: {} };
       const f = src.fields || {};
       return {
-        key: r.key,
-        summary: f.summary || '',
-        status: f.status?.name || '',
-        issueType: f.issuetype?.name || '',
-        priority: f.priority?.name || '',
-        updated: f.updated,
-        score: r.score,
-        reason: r.reason,
-        _tier: r._tier
+        key: r.key, summary: f.summary || '',
+        status: f.status?.name || '', issueType: f.issuetype?.name || '',
+        priority: f.priority?.name || '', updated: f.updated,
+        score: r.score, reason: r.reason, _tier: r._tier
       };
     });
 
     return {
-      query,
-      jql: channels.map((c) => c.jql).join(' | '),
-      issues: simplified,
-      total: candidates.length,
+      query, jql: channels.map((c) => c.jql).join(' | '),
+      issues: simplified, total: candidates.length,
       candidatesBeforeRerank: candidates.length,
-      channels: channels.map((c) => ({ tier: c.tier, jql: c.jql })),
+      channels: channels.map((c) => ({ tier: c.tier })),
       reranked: Boolean(this.llm),
+      searchMode: 'keyword',
       subQueryCount: subQueries.length,
-      subQueryFocuses: subQueries.map((sq) => sq.focus),
-      vectorEnabled,
-      vectorIndexCount: vectorCount,
-      vectorRecall
+      vectorEnabled, vectorIndexCount: vectorCount, vectorRecall
     };
   }
 
