@@ -479,8 +479,15 @@ export class ToolExecutor {
       };
     }
 
-    // Vector search: one embed of the original query, cosine search.
-    // Runs in parallel with all JQL channels.
+    // Vector search: embed EACH sub-query separately and run cosine search.
+    // This is critical for coverage: "EHT PD tickets" as a single embed is too
+    // generic to match specific tickets about "setup violation" or "SDC
+    // constraint". But embedding "EHT timing STA setup hold violation" and
+    // "EHT SDC constraint create_clock false_path" separately produces vectors
+    // that match the right domain-specific tickets in the index.
+    //
+    // We also embed the original query for a broad semantic sweep.
+    // All vector searches run in parallel with JQL channels.
     const vectorEnabled = Boolean(this.llm?.isEmbeddingEnabled);
     const vectorCount = vectorEnabled ? await indexCount() : 0;
     const shouldRunVector = vectorEnabled && vectorCount > 0;
@@ -493,15 +500,45 @@ export class ToolExecutor {
       });
 
     if (shouldRunVector) {
+      // Build one vector-search query text per sub-query (primaryTerms + synonyms joined),
+      // plus the original user query. Each gets its own embed + cosine search.
+      // Batch the embeds for efficiency.
+      const vecQueries = [
+        query, // original user query (broad semantic sweep)
+        ...subQueries.map((sq) => {
+          const terms = [...(sq.primaryTerms || []), ...(sq.synonyms || [])];
+          return terms.length > 0 ? terms.join(' ') : query;
+        })
+      ];
+
       allTasks.push((async () => {
-        const [queryVec] = await this.llm.embed(query);
-        const hits = await vectorSearch(queryVec, {
-          topK: VECTOR_TOP_K,
-          queryModel: this.llm.embedModel
-        });
+        // Batch embed all sub-query texts in one API call
+        const vecs = await this.llm.embed(vecQueries);
+        const vecResults = await Promise.all(
+          vecs.map(async (vec, idx) => {
+            if (!Array.isArray(vec) || vec.length === 0) return [];
+            const hits = await vectorSearch(vec, {
+              topK: VECTOR_TOP_K,
+              queryModel: this.llm.embedModel
+            });
+            return hits;
+          })
+        );
+
+        // Merge all vector hits, dedup by key (keep highest score)
+        const bestByKey = new Map();
+        for (const hits of vecResults) {
+          for (const h of hits) {
+            const existing = bestByKey.get(h.key);
+            if (!existing || h.score > existing.score) {
+              bestByKey.set(h.key, h);
+            }
+          }
+        }
+
         return {
           tier: 0,
-          issues: hits.map((h) => ({
+          issues: Array.from(bestByKey.values()).map((h) => ({
             key: h.key,
             fields: {
               summary: h.meta?.summary || '',
