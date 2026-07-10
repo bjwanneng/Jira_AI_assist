@@ -429,6 +429,10 @@ export class ToolExecutor {
     // filtering. We also keep a text-search fallback for safety.
     const mandatoryTerms = Array.isArray(expansion.mandatoryTerms) ? expansion.mandatoryTerms.filter(t => t && t.length >= 2) : [];
     const baseFilterClauses = [];
+    // Default time range: last 5 years. Jira Cloud requires bounded JQL,
+    // and this ensures we capture historical PD tickets from 2025+.
+    const fiveYearsAgo = new Date(Date.now() - 5 * 365 * 86400000).toISOString().slice(0, 10);
+    baseFilterClauses.push(`updated >= "${fiveYearsAgo}"`);
     if (project) baseFilterClauses.push(`project = ${project.toUpperCase().replace(/[^A-Z0-9_]/gi, '')}`);
     if (status) baseFilterClauses.push(`status = "${String(status).replace(/"/g, '\\"')}"`);
     if (issueType) baseFilterClauses.push(`issuetype = "${String(issueType).replace(/"/g, '\\"')}"`);
@@ -470,9 +474,18 @@ export class ToolExecutor {
     const subQueries = expansion.subQueries;
     const channels = [];
     let sortIdx = 0;
+    // Cap sub-queries to avoid generating too many parallel JQL channels.
+    // Each sub-query generates up to 3 channels (org-field + text-filter +
+    // no-filter). With Jira Cloud's rate limits, >15 parallel calls risks 429s.
+    const MAX_CHANNELS = 15;
     for (const sq of subQueries) {
-      // Merge primaryTerms + synonyms into one OR list for this sub-query
-      const allTerms = [...(sq.primaryTerms || []), ...(sq.synonyms || [])];
+      if (channels.length >= MAX_CHANNELS) {
+        console.log('[search_jira] hit MAX_CHANNELS=%d, skipping remaining sub-queries', MAX_CHANNELS);
+        break;
+      }
+      // Merge primaryTerms + synonyms into one OR list, cap at 8 terms to keep
+      // JQL manageable (each term adds ~30 chars to the query)
+      const allTerms = [...(sq.primaryTerms || []), ...(sq.synonyms || [])].slice(0, 8);
       if (allTerms.length === 0) continue;
       const termOr = `(${allTerms.map((t) => buildJqlTextClause(t)).join(' OR ')})`;
 

@@ -15,11 +15,42 @@ const PATHOLOGICAL_SAFETY_NET = 100;
 
 /**
  * Cap the size of a tool result before feeding it back into the model context.
- * Large results (find_similar_issues, search_jira, read_url) can otherwise
- * balloon the conversation history across many tool rounds and blow the token
- * budget. The full result is still kept in `toolCalls` for the UI.
+ * For search results, prioritizes the issues list over JQL/channels metadata
+ * so the LLM always sees the actual ticket data even when truncated.
  */
-function compactToolResult(result, maxChars = 6000) {
+function compactToolResult(result, maxChars = 8000) {
+  // For search_jira results, strip JQL/channels to save space for issues
+  if (result && typeof result === 'object' && Array.isArray(result.issues)) {
+    const compact = { ...result };
+    // Replace verbose JQL string with a short note
+    if (compact.jql) compact.jql = `(JQL omitted - ${compact.subQueryCount || '?'} sub-queries)`;
+    // Remove channel details entirely (they're just JQL strings)
+    delete compact.channels;
+    delete compact.subQueryFocuses;
+    let str;
+    try { str = JSON.stringify(compact, null, 2); } catch { str = String(compact); }
+    if (str.length <= maxChars) return str;
+    // Still too long: keep only the issues array + query + total
+    const issuesOnly = JSON.stringify({
+      query: compact.query,
+      total: compact.total,
+      issues: compact.issues,
+      subQueryCount: compact.subQueryCount,
+      vectorEnabled: compact.vectorEnabled,
+      vectorRecall: compact.vectorRecall
+    }, null, 2);
+    if (issuesOnly.length <= maxChars) return issuesOnly;
+    // Last resort: truncate the issues array itself
+    const maxIssues = Math.max(5, Math.floor(maxChars / 300)); // ~300 chars per issue
+    const truncated = {
+      query: compact.query,
+      total: compact.total,
+      issues: compact.issues.slice(0, maxIssues),
+      note: `Showing top ${maxIssues} of ${compact.issues.length} issues`
+    };
+    return JSON.stringify(truncated, null, 2);
+  }
+
   let str;
   try {
     str = JSON.stringify(result, null, 2);
