@@ -1,7 +1,8 @@
 import { ApiClient, simplifyIssue, simplifySearchResults, simplifyConfluenceResults, SlackClient, simplifySlackMessages, simplifySlackFiles, DriveClient, simplifyDriveFiles } from './api-client.js';
 import { extractTextFromHtml, parseAtlassianUrl, detectIssueKey, truncateToTokens, buildJqlTextClause } from '../shared/utils.js';
 import { reciprocalRankFusion } from '../shared/rrf.js';
-import { MAX_RERANK_CANDIDATES, MAX_RERANKED_RESULTS, RRF_K, MAX_CLUSTER_CANDIDATES } from '../shared/constants.js';
+import { MAX_RERANK_CANDIDATES, MAX_RERANKED_RESULTS, RRF_K, MAX_CLUSTER_CANDIDATES, VECTOR_TOP_K } from '../shared/constants.js';
+import { issueToEmbedText, vectorSearch, indexCount, syncNewIssues } from './ticket-indexer.js';
 import { getOrSummarize } from './ticket-summarizer.js';
 import { getOrExpand } from './query-expander.js';
 import { rerankCandidates } from './reranker.js';
@@ -421,12 +422,17 @@ export class ToolExecutor {
       };
     }
 
-    // Build the two JQL channels. Both apply the same hard filters (project,
-    // status, issueType) so rerank candidates are pre-filtered.
+    // Build hard filters: project, status, issueType, AND mandatory terms
+    // (customer names like "EHT"). Mandatory terms become AND text filters so
+    // every result MUST contain them - they don't get lost in OR expansion.
+    const mandatoryTerms = Array.isArray(expansion.mandatoryTerms) ? expansion.mandatoryTerms.filter(t => t && t.length >= 2) : [];
     const filterClauses = [];
     if (project) filterClauses.push(`project = ${project.toUpperCase().replace(/[^A-Z0-9_]/gi, '')}`);
     if (status) filterClauses.push(`status = "${String(status).replace(/"/g, '\\"')}"`);
     if (issueType) filterClauses.push(`issuetype = "${String(issueType).replace(/"/g, '\\"')}"`);
+    for (const mt of mandatoryTerms) {
+      filterClauses.push(buildJqlTextClause(mt));
+    }
     const filterStr = filterClauses.length ? ' AND ' + filterClauses.join(' AND ') : '';
 
     // Build JQL channels: 2 per sub-query (primaryTerms + synonyms).

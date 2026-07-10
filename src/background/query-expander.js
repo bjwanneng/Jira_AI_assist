@@ -52,6 +52,7 @@ When the query mentions a customer name, include it in primaryTerms so Jira's te
 
 Return ONLY a JSON object (no prose, no markdown fence):
 {
+  "mandatoryTerms": ["customer or entity names that MUST appear in every result, e.g. 'EHT'"],
   "subQueries": [
     {
       "focus": "short label for this sub-domain, e.g. 'timing' or 'SDC'",
@@ -62,9 +63,10 @@ Return ONLY a JSON object (no prose, no markdown fence):
 }
 
 Rules:
+- mandatoryTerms: extract customer/entity names (EHT, AMD, ESWIN, etc.) from the query. These become AND filters so every result MUST contain them. Leave empty if no customer name is present.
 - Produce 1-6 sub-queries depending on query breadth. A narrow query ("BEU interrupt") = 1 sub-query. A broad query ("EHT PD tickets") = 4-6 sub-queries covering distinct sub-domains.
 - Each term 2-32 chars. Skip stop words.
-- Include customer names in primaryTerms when relevant.
+- Do NOT put customer names in sub-query primaryTerms - put them ONLY in mandatoryTerms.
 - Do NOT duplicate the same term across many sub-queries - each sub-query should have distinct keywords.`;
 
 function asStringArr(v, max = 10) {
@@ -80,6 +82,7 @@ function normalizeSubQueries(parsed) {
 
   // v2 format: subQueries array
   if (Array.isArray(parsed.subQueries) && parsed.subQueries.length > 0) {
+    const mandatoryTerms = asStringArr(parsed.mandatoryTerms, 5);
     const subs = parsed.subQueries
       .map((sq) => ({
         focus: typeof sq.focus === 'string' ? sq.focus.slice(0, 40) : '',
@@ -88,7 +91,7 @@ function normalizeSubQueries(parsed) {
       }))
       .filter((sq) => sq.primaryTerms.length > 0 || sq.synonyms.length > 0);
     if (subs.length === 0) return null;
-    return { subQueries: subs };
+    return { mandatoryTerms, subQueries: subs };
   }
 
   // v1 format: flat primaryTerms + synonyms (backward compat)
