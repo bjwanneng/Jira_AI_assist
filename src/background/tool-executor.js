@@ -460,9 +460,13 @@ export class ToolExecutor {
     // into a single OR list per sub-query (instead of separate channels).
     // This halves the channel count while maintaining the same coverage.
     //
-    // Sort order: alternate between `updated DESC` and `created DESC` across
-    // channels so we capture BOTH recent tickets AND older ones.
-    const SORT_ORDERS = ['updated DESC', 'created DESC'];
+    // Sort order: alternate between `updated DESC` (recently active tickets)
+    // and `created ASC` (oldest tickets first). Using `created ASC` is critical:
+    // `created DESC` returns newest-created tickets first, which are still 2026
+    // tickets — it does NOT surface 2025 tickets. `created ASC` puts the oldest
+    // matching tickets at the top of the maxResults window, ensuring historical
+    // coverage. RRF fusion then balances recent + historical results.
+    const SORT_ORDERS = ['updated DESC', 'created ASC'];
     const subQueries = expansion.subQueries;
     const channels = [];
     let sortIdx = 0;

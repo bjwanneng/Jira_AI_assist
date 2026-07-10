@@ -53,7 +53,7 @@ const baseFilter = project ? ` AND project = ${project.toUpperCase()}` : '';
 const orgFilter = MANDATORY_TERMS.length ? ` AND "customfield_10400" in (${MANDATORY_TERMS.map(t => `"${t}"`).join(',')})` : '';
 const textFilter = MANDATORY_TERMS.length ? ' AND ' + MANDATORY_TERMS.map(t => buildTextClause(t)).join(' AND ') : '';
 
-const SORT_ORDERS = ['updated DESC', 'created DESC'];
+const SORT_ORDERS = ['updated DESC', 'created ASC'];
 const channels = [];
 let sortIdx = 0;
 for (const sq of SUB_QUERIES) {
