@@ -387,7 +387,7 @@ export class ToolExecutor {
     const project = typeof args === 'object' ? args?.project : null;
     const status = typeof args === 'object' ? args?.status : null;
     const issueType = typeof args === 'object' ? args?.issueType : null;
-    const maxResults = (typeof args === 'object' ? args?.maxResults : null) || 10;
+    const maxResults = (typeof args === 'object' ? args?.maxResults : null) || 20;
 
     if (!query) return { error: 'Missing query parameter' };
 
@@ -422,31 +422,47 @@ export class ToolExecutor {
       };
     }
 
-    // Build hard filters: project, status, issueType, AND mandatory terms
-    // (customer names like "EHT"). Mandatory terms become AND text filters so
-    // every result MUST contain them - they don't get lost in OR expansion.
+    // Build hard filters: project, status, issueType.
+    // Customer names (mandatoryTerms) are NOT hard-filtered because many tickets
+    // lack the [EHT] tag in summary — a strict AND would exclude them. Instead
+    // we run TWO JQL variants per sub-query: one WITH the customer AND filter
+    // (high precision), one WITHOUT (high recall). RRF fusion naturally boosts
+    // tickets that appear in both lists.
     const mandatoryTerms = Array.isArray(expansion.mandatoryTerms) ? expansion.mandatoryTerms.filter(t => t && t.length >= 2) : [];
-    const filterClauses = [];
-    if (project) filterClauses.push(`project = ${project.toUpperCase().replace(/[^A-Z0-9_]/gi, '')}`);
-    if (status) filterClauses.push(`status = "${String(status).replace(/"/g, '\\"')}"`);
-    if (issueType) filterClauses.push(`issuetype = "${String(issueType).replace(/"/g, '\\"')}"`);
-    for (const mt of mandatoryTerms) {
-      filterClauses.push(buildJqlTextClause(mt));
-    }
-    const filterStr = filterClauses.length ? ' AND ' + filterClauses.join(' AND ') : '';
+    const baseFilterClauses = [];
+    if (project) baseFilterClauses.push(`project = ${project.toUpperCase().replace(/[^A-Z0-9_]/gi, '')}`);
+    if (status) baseFilterClauses.push(`status = "${String(status).replace(/"/g, '\\"')}"`);
+    if (issueType) baseFilterClauses.push(`issuetype = "${String(issueType).replace(/"/g, '\\"')}"`);
+    const mandatoryClause = mandatoryTerms.length
+      ? ' AND ' + mandatoryTerms.map((t) => buildJqlTextClause(t)).join(' AND ')
+      : '';
+    const baseFilterStr = baseFilterClauses.length ? ' AND ' + baseFilterClauses.join(' AND ') : '';
 
-    // Build JQL channels: 2 per sub-query (primaryTerms + synonyms).
+    // Build JQL channels: for each sub-query, run 2 variants (with/without
+    // customer filter) × 2 term lists (primaryTerms + synonyms) = up to 4
+    // channels per sub-query. This maximizes recall while still preferring
+    // customer-tagged tickets via RRF boost.
     const subQueries = expansion.subQueries;
     const channels = [];
     for (let si = 0; si < subQueries.length; si++) {
       const sq = subQueries[si];
+      // Variant A: with customer AND filter (high precision, tier 1/2)
       if (sq.primaryTerms?.length) {
         const textOr = sq.primaryTerms.map((t) => buildJqlTextClause(t)).join(' OR ');
-        channels.push({ tier: 1, subIndex: si, jql: `(${textOr})${filterStr} ORDER BY updated DESC` });
+        channels.push({ tier: 1, jql: `(${textOr})${mandatoryClause}${baseFilterStr} ORDER BY updated DESC` });
       }
       if (sq.synonyms?.length) {
         const textOr = sq.synonyms.map((t) => buildJqlTextClause(t)).join(' OR ');
-        channels.push({ tier: 2, subIndex: si, jql: `(${textOr})${filterStr} ORDER BY updated DESC` });
+        channels.push({ tier: 2, jql: `(${textOr})${mandatoryClause}${baseFilterStr} ORDER BY updated DESC` });
+      }
+      // Variant B: without customer filter (high recall, tier 3/4)
+      if (sq.primaryTerms?.length) {
+        const textOr = sq.primaryTerms.map((t) => buildJqlTextClause(t)).join(' OR ');
+        channels.push({ tier: 3, jql: `(${textOr})${baseFilterStr} ORDER BY updated DESC` });
+      }
+      if (sq.synonyms?.length) {
+        const textOr = sq.synonyms.map((t) => buildJqlTextClause(t)).join(' OR ');
+        channels.push({ tier: 4, jql: `(${textOr})${baseFilterStr} ORDER BY updated DESC` });
       }
     }
 
@@ -543,13 +559,14 @@ export class ToolExecutor {
 
     console.log('[search_jira] RRF fused: %d unique candidates, reranking top %d...', candidates.length, Math.min(MAX_RERANKED_RESULTS, maxResults));
 
-    // Rerank with LLM. Source = { query, expansion } so the reranker prompt
-    // has the user's intent + extracted terms.
+    // Rerank with LLM. Use maxResults directly (not MAX_RERANKED_RESULTS) so
+    // the caller controls how many results they get. The reranker scores all
+    // candidates, then we take the top-N.
     const ranked = await rerankCandidates(
       { query, expansion },
       candidates,
       this.llm,
-      { topN: Math.min(MAX_RERANKED_RESULTS, maxResults) }
+      { topN: Math.min(maxResults, candidates.length) }
     );
 
     const fieldByKey = new Map(candidates.map((it) => [it.key, it]));

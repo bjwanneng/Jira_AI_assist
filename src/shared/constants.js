@@ -69,8 +69,8 @@ export const MAX_COMMENTS = 20;
 export const LLM_TIMEOUT_MS = 60000;
 
 // Hybrid search + rerank pipeline tuning.
-export const MAX_RERANK_CANDIDATES = 50;
-export const MAX_RERANKED_RESULTS = 10;
+export const MAX_RERANK_CANDIDATES = 80;
+export const MAX_RERANKED_RESULTS = 30;
 export const RRF_K = 60;
 
 // Cross-ticket pattern analysis (cluster-analyzer) tuning.
@@ -99,8 +99,8 @@ export const INDEX_PAGE_SIZE = 100; // JQL page size when bulk-loading
 // then pulls only the most recently updated tickets, which is what we want.
 export const INDEX_JQL_LOWER_BOUND = '2000-01-01'; // updated >= this date
 export const EMBED_TEXT_MAX_CHARS = 4000; // chars of ticket text sent to embed()
-export const VECTOR_TOP_K = 30; // candidates pulled from the vector channel
-export const VECTOR_MIN_SCORE = 0.30; // cosine threshold for vector recall
+export const VECTOR_TOP_K = 50; // candidates pulled from the vector channel
+export const VECTOR_MIN_SCORE = 0.20; // cosine threshold for vector recall (lowered for broad coverage)
 // Vector is the PRIMARY recall channel. If it returns fewer than this many
 // neighbours we consider it too weak to stand on its own and fall back to (or
 // fuse with) the legacy JQL/keyword channel.

@@ -105,14 +105,18 @@ function buildScoreMap(parsed) {
  * Rerank candidates via a single LLM call.
  *
  * @param {object} source - { summary, issueKey } OR { query, expansion }
- * @param {Array} candidates - top-20 issues from RRF (each with _rrfScore, _tier)
+ * @param {Array} candidates - issues from RRF (each with _rrfScore, _tier)
  * @param {object} llm - LlmClient instance
  * @param {{ topN?: number }} [opts]
  * @returns {Promise<Array<{key, score, reason, _rrfScore, _tier, fields?}>>}
  */
 export async function rerankCandidates(source, candidates, llm, opts = {}) {
   const topN = opts.topN ?? MAX_RERANKED_RESULTS;
-  const pool = (candidates || []).slice(0, MAX_RERANK_CANDIDATES);
+  // Cap the rerank pool to keep the LLM prompt manageable. 50 candidates
+  // × ~30 tokens each (key + summary + status) ≈ 1.5k tokens, well within
+  // budget for a single cheap-model call.
+  const RERANK_POOL_CAP = 50;
+  const pool = (candidates || []).slice(0, Math.min(RERANK_POOL_CAP, candidates.length));
 
   // Nothing to rerank — return as-is (sorted by RRF score, no reasons).
   if (pool.length === 0) return [];
