@@ -116,7 +116,7 @@ export async function rerankCandidates(source, candidates, llm, opts = {}) {
   // uses ~50 tokens (key + summary + status). With a 4096 token limit on
   // cheap models, 40 candidates ≈ 2k tokens for candidates + 1k for prompt
   // template + source context = ~3k, leaving headroom.
-  const RERANK_POOL_CAP = 30;
+  const RERANK_POOL_CAP = 20;
   const pool = (candidates || []).slice(0, Math.min(RERANK_POOL_CAP, candidates.length));
 
   // Nothing to rerank — return as-is (sorted by RRF score, no reasons).

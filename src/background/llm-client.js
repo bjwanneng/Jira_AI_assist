@@ -254,7 +254,7 @@ export class LlmClient {
       return data.choices?.[0]?.message || { role: 'assistant', content: '' };
     } catch (err) {
       clearTimeout(timeoutId);
-      throw this._wrapError(err);
+      throw await this._wrapError(err);
     }
   }
 
