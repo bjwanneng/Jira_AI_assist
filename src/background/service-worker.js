@@ -4,6 +4,7 @@ import { ChatOrchestrator } from './chat-orchestrator.js';
 import { LlmClient } from './llm-client.js';
 import { ApiClient, SlackClient } from './api-client.js';
 import { buildWeeklySummary } from './weekly-summary-builder.js';
+import { buildIndex, clearIndex, syncNewIssues, countScope } from './ticket-indexer.js';
 
 const allKeys = Object.values(STORAGE_KEYS);
 
@@ -68,55 +69,99 @@ async function resetOrchestrator(scopeKey) {
   }
 }
 
+// Handle a chat query WITHOUT sendResponse. The final result is delivered
+// as a separate one-way CHAT_DONE message so the response channel is not a
+// long-lived sendResponse that can be killed mid-query (triggering the
+// "message channel closed before a response was received" warning — common
+// when a query runs long and the sender context, e.g. a Jira tab, is
+// reclaimed by MV3).
+async function handleChatMessage(message, sender) {
+  const conversationId = message.payload?.conversationId;
+  const senderTabId = sender.tab?.id;
+  const isExtensionPage = sender.url?.startsWith('chrome-extension://');
+
+  // Deliver the final result (and any early config error) as a one-way
+  // message. Fire-and-forget: if the sender is gone, there is nothing to do.
+  const sendDone = (payload) => {
+    try {
+      const msg = {
+        type: MESSAGE_TYPES.CHAT_DONE,
+        payload: { ...payload, conversationId }
+      };
+      if (isExtensionPage) {
+        chrome.runtime.sendMessage(msg).catch(() => {});
+      } else if (senderTabId !== undefined) {
+        chrome.tabs.sendMessage(senderTabId, msg).catch(() => {});
+      }
+    } catch (e) {
+      // ignore — sender may have been torn down
+    }
+  };
+
+  const onDelta = (delta) => {
+    try {
+      const msg = {
+        type: MESSAGE_TYPES.CHAT_DELTA,
+        payload: { ...delta, conversationId }
+      };
+      if (isExtensionPage) {
+        chrome.runtime.sendMessage(msg).catch(() => {});
+      } else if (senderTabId !== undefined) {
+        chrome.tabs.sendMessage(senderTabId, msg).catch(() => {});
+      }
+    } catch (e) {
+      // SW may have just started; ignore send failures.
+    }
+  };
+
+  const config = await loadConfig();
+  if (!config.llmBaseUrl || !config.llmApiKey) {
+    sendDone({ success: false, error: { message: 'LLM not configured. Open extension settings.' } });
+    return;
+  }
+  if (!config.jiraBaseUrl || !config.jiraApiToken) {
+    sendDone({ success: false, error: { message: 'Jira not configured. Open extension settings.' } });
+    return;
+  }
+
+  const orchestrator = getOrchestrator(config, message.payload.issueKey, senderTabId, conversationId);
+  if (message.payload.sourceFlags) {
+    orchestrator.setConversationMeta({ sourceFlags: message.payload.sourceFlags });
+  }
+
+  try {
+    const data = await orchestrator.handle(message.payload, onDelta);
+    sendDone({ success: true, data });
+  } catch (err) {
+    sendDone({
+      success: false,
+      error: {
+        message: err.message,
+        code: err.code || null,
+        llmBaseUrl: err.llmBaseUrl || null
+      }
+    });
+  }
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  // CHAT_MESSAGE is handled WITHOUT sendResponse: the final result is
+  // delivered as a SEPARATE one-way CHAT_DONE message (see handleChatMessage),
+  // so the result channel is NOT a long-lived sendResponse that can die
+  // mid-query (MV3 SW reclamation, or the Jira tab context being torn
+  // down) and log "message channel closed before a response was received".
+  // Return false immediately — there is no channel to keep open.
+  if (message.type === MESSAGE_TYPES.CHAT_MESSAGE) {
+    handleChatMessage(message, sender).catch(() => {});
+    return false;
+  }
+
   (async () => {
     try {
       switch (message.type) {
         case MESSAGE_TYPES.CHAT_MESSAGE: {
-          const config = await loadConfig();
-          if (!config.llmBaseUrl || !config.llmApiKey) {
-            return sendResponse({ success: false, error: { message: 'LLM not configured. Open extension settings.' } });
-          }
-          if (!config.jiraBaseUrl || !config.jiraApiToken) {
-            return sendResponse({ success: false, error: { message: 'Jira not configured. Open extension settings.' } });
-          }
-
-          const orchestrator = getOrchestrator(config, message.payload.issueKey, sender.tab?.id, message.payload.conversationId);
-
-          // Apply per-conversation source flags before handle(). The chat
-          // page sends these in the payload; the Jira sidebar leaves defaults.
-          if (message.payload.sourceFlags) {
-            orchestrator.setConversationMeta({
-              sourceFlags: message.payload.sourceFlags
-            });
-          }
-
-          // Stream reasoning tokens back to the chat UI in real-time.
-          // Extension pages (chrome-extension://...) listen on
-          // chrome.runtime.onMessage and filter by conversationId. Content
-          // scripts in Jira tabs receive via chrome.tabs.sendMessage for
-          // targeted delivery — no filter needed.
-          const conversationId = message.payload.conversationId;
-          const senderTabId = sender.tab?.id;
-          const isExtensionPage = sender.url?.startsWith('chrome-extension://');
-          const onDelta = (delta) => {
-            try {
-              const msg = {
-                type: MESSAGE_TYPES.CHAT_DELTA,
-                payload: { ...delta, conversationId }
-              };
-              if (isExtensionPage) {
-                chrome.runtime.sendMessage(msg).catch(() => {});
-              } else if (senderTabId !== undefined) {
-                chrome.tabs.sendMessage(senderTabId, msg).catch(() => {});
-              }
-            } catch (e) {
-              // SW may have just started; ignore send failures.
-            }
-          };
-
-          const data = await orchestrator.handle(message.payload, onDelta);
-          return sendResponse({ success: true, data });
+          // (handled above without sendResponse)
+          return;
         }
 
         case MESSAGE_TYPES.RESET_CONVERSATION: {
@@ -225,6 +270,83 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           }
           const data = await buildWeeklySummary(config);
           return sendResponse({ success: true, data });
+        }
+
+        case MESSAGE_TYPES.TEST_EMBEDDING_CONNECTION: {
+          const config = await loadConfig();
+          if (!config.embedBaseUrl && !config.llmBaseUrl) {
+            return sendResponse({ success: false, error: 'Embedding base URL not configured (and no LLM base URL to fall back to).' });
+          }
+          try {
+            const llm = new LlmClient(config);
+            if (!llm.isEmbeddingEnabled) {
+              return sendResponse({ success: false, error: 'Embedding not configured. Fill in the Vector Search section.' });
+            }
+            const [vec] = await llm.embed('connection test');
+            return sendResponse({ success: true, model: llm.embedModel, dims: vec?.length || 0 });
+          } catch (err) {
+            return sendResponse({ success: false, error: err.message });
+          }
+        }
+
+        case MESSAGE_TYPES.BUILD_EMBEDDING_INDEX: {
+          const config = await loadConfig();
+          if (!config.jiraBaseUrl || !config.jiraApiToken) {
+            return sendResponse({ success: false, error: { message: 'Jira not configured. Open extension settings.' } });
+          }
+          try {
+            const result = await buildIndex(config, {
+              onProgress: (p) => {
+                chrome.runtime.sendMessage(
+                  { type: MESSAGE_TYPES.EMBEDDING_INDEX_PROGRESS, payload: p }
+                ).catch(() => {});
+              }
+            });
+            return sendResponse({ success: true, data: result });
+          } catch (err) {
+            return sendResponse({ success: false, error: err.message });
+          }
+        }
+
+        case MESSAGE_TYPES.COUNT_INDEX_SCOPE: {
+          const config = await loadConfig();
+          if (!config.jiraBaseUrl || !config.jiraApiToken) {
+            return sendResponse({ success: false, error: 'Jira not configured. Open extension settings.' });
+          }
+          try {
+            const result = await countScope(config, { exact: Boolean(message.exact) });
+            return sendResponse({ success: true, data: result });
+          } catch (err) {
+            return sendResponse({ success: false, error: err.message });
+          }
+        }
+
+        case MESSAGE_TYPES.CLEAR_EMBEDDING_INDEX: {
+          try {
+            await clearIndex();
+            return sendResponse({ success: true, count: 0 });
+          } catch (err) {
+            return sendResponse({ success: false, error: err.message });
+          }
+        }
+
+        case MESSAGE_TYPES.SYNC_EMBEDDING_INDEX: {
+          const config = await loadConfig();
+          if (!config.jiraBaseUrl || !config.jiraApiToken) {
+            return sendResponse({ success: false, error: { message: 'Jira not configured. Open extension settings.' } });
+          }
+          try {
+            const result = await syncNewIssues(config, {
+              onProgress: (p) => {
+                chrome.runtime.sendMessage(
+                  { type: MESSAGE_TYPES.EMBEDDING_INDEX_PROGRESS, payload: p }
+                ).catch(() => {});
+              }
+            });
+            return sendResponse({ success: true, data: result });
+          } catch (err) {
+            return sendResponse({ success: false, error: err.message });
+          }
         }
 
         default:

@@ -1,0 +1,5 @@
+{
+  "jiraBaseUrl": "https://YOUR-SITE.atlassian.net",
+  "jiraEmail": "you@example.com",
+  "jiraApiToken": "paste-a-READ-ONLY-jira-api-token-here"
+}

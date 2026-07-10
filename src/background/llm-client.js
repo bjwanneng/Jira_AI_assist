@@ -1,6 +1,26 @@
 import { LLM_TIMEOUT_MS } from '../shared/constants.js';
 import { hasHostPermission } from '../shared/permissions.js';
 
+/**
+ * Coerce an embedding payload into a number[].
+ * Handles both float arrays and base64-encoded float32 strings (some
+ * endpoints ignore `encoding_format: "float"` and return base64).
+ */
+function toVector(e) {
+  if (Array.isArray(e)) return e.map(Number);
+  if (typeof e === 'string') {
+    try {
+      const bin = atob(e);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      return Array.from(new Float32Array(bytes.buffer));
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
 export class LlmClient {
   constructor(config) {
     this.config = config;
@@ -14,10 +34,160 @@ export class LlmClient {
     // uses its own default maximum context for completion).
     this.maxTokens = config.llmMaxTokens || 0;
     this.temperature = config.llmTemperature ?? 0.3;
+
+    // --- Dense-vector embedding config (separate from the chat LLM) ---
+    // Embeddings may come from a DIFFERENT provider than the chat model
+    // (e.g. chat on Kimi, embeddings on Zhipu embedding-3). Defaults fall
+    // back to the chat LLM's host/key so a single OpenAI-compatible account
+    // still works without extra setup.
+    this.embedBaseUrl = (config.embedBaseUrl || config.llmBaseUrl || '').replace(/\/$/, '');
+    this.embedApiKey = config.embedApiKey || config.llmApiKey || '';
+    this.embedModel = config.embeddingModel || 'text-embedding-3-small';
+    this.embedDims = Number(config.embedDims) || 0;
+    // 'openai' (default) or 'ark-multimodal' — controls the request path
+    // and the shape of `input` (see embed()).
+    this.embedApiStyle = config.embedApiStyle || 'openai';
   }
 
   get chatCompletionsUrl() {
     return `${this.baseUrl}/chat/completions`;
+  }
+
+  get embeddingsUrl() {
+    // Volcengine Ark multimodal models live at /embeddings/multimodal
+    // (the plain /embeddings path serves text-only models). OpenAI-compatible
+    // providers use /embeddings.
+    const suffix = this.embedApiStyle === 'ark-multimodal' ? '/embeddings/multimodal' : '/embeddings';
+    return `${this.embedBaseUrl}${suffix}`;
+  }
+
+  /**
+   * Whether a usable embedding endpoint is configured. Embeddings and chat
+   * are independent: the chat model may be unset (legacy search) while
+   * embeddings are ready, and vice-versa.
+   */
+  get isEmbeddingEnabled() {
+    return Boolean(this.embedBaseUrl && this.embedApiKey && this.embedModel);
+  }
+
+  /**
+   * Generate dense vectors for one or more texts.
+   *
+   * Two request styles are supported (selected via `embedApiStyle`):
+   *   - 'openai' (default): POST {base}/embeddings with `input` as a
+   *     string or string[] — works for OpenAI, Zhipu embedding-3, Ollama, ...
+   *   - 'ark-multimodal': POST {base}/embeddings/multimodal with `input`
+   *     as an array of content objects `[{ type:'text', text }]` — required
+   *     by Volcengine Ark doubao-embedding-vision / multimodal models.
+   *
+   * Returns number[][] — one vector per input text, in order.
+   *
+   * @param {string|string[]} texts - single string or array
+   * @returns {Promise<number[][]>}
+   */
+  async embed(texts) {
+    if (!this.isEmbeddingEnabled) {
+      throw new Error('Embedding not configured. Open extension settings and fill in the Vector Search (Embedding) section.');
+    }
+    const style = this.embedApiStyle === 'ark-multimodal' ? 'ark-multimodal' : 'openai';
+    const rawTexts = Array.isArray(texts) ? texts : [texts];
+    // Ark multimodal requires the content-object shape even for text-only
+    // input; plain OpenAI-compatible endpoints want bare strings.
+    const input = style === 'ark-multimodal'
+      ? rawTexts.map((t) => ({ type: 'text', text: String(t) }))
+      : rawTexts;
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), LLM_TIMEOUT_MS);
+    try {
+      const body = { model: this.embedModel, input };
+      // Always ask for float vectors — some endpoints default to base64
+      // strings, which our parser would mistake for "no vector".
+      body.encoding_format = 'float';
+      // Only send `dimensions` when explicitly set — most providers either
+      // ignore it (fixed-dim models) or require it. text-embedding-3-* and
+      // Zhipu embedding-3 honor it for dimensionality reduction.
+      if (this.embedDims && this.embedDims > 0) {
+        body.dimensions = this.embedDims;
+      }
+      const res = await fetch(this.embeddingsUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${this.embedApiKey}`
+        },
+        body: JSON.stringify(body),
+        signal: controller.signal
+      });
+      clearTimeout(timeoutId);
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        throw new Error(`Embedding API error ${res.status}: ${text.slice(0, 300)}`);
+      }
+      const data = await res.json();
+
+      // Normalize to number[][] across the response shapes providers use:
+      //   OpenAI / Zhipu / Ark-text : { data: [ { embedding:[...] }, ... ] }
+      //   Ark multimodal (object)    : { data: { embedding:[...] } }
+      //   Ark envelope              : { code, message, data: [ ... ] }
+      //   bare embedding           : { embedding:[...] }  |  [ 0.1, 0.2, ... ]
+      let arr = null;
+      if (Array.isArray(data?.data) && typeof data.data[0] === 'number') {
+        arr = [{ embedding: data.data }];
+      } else if (Array.isArray(data?.data)) {
+        arr = data.data;
+      } else if (data?.data && Array.isArray(data.data.embedding)) {
+        arr = [{ embedding: data.data.embedding }];
+      } else if (Array.isArray(data?.embeddings)) {
+        arr = data.embeddings.map((e) => ({ embedding: e }));
+      } else if (Array.isArray(data?.embedding)) {
+        arr = [{ embedding: data.embedding }];
+      } else if (Array.isArray(data) && typeof data[0] === 'number') {
+        arr = [{ embedding: data }];
+      }
+
+      if (!arr) {
+        throw new Error(
+          'Embedding API returned an unexpected shape (no recognizable embedding). ' +
+          'Raw response: ' + JSON.stringify(data).slice(0, 600)
+        );
+      }
+
+      const vectors = arr.map((d) => toVector(d?.embedding)).filter(Array.isArray);
+      if (vectors.length === 0) {
+        throw new Error(
+          'Embedding API returned 0 usable vectors. ' +
+          'Raw response: ' + JSON.stringify(data).slice(0, 600)
+        );
+      }
+
+      // Providers may return more vectors than requested (trim those).
+      // If they return FEWER, that's a provider bug - silently duplicating
+      // via modular arithmetic would poison the index with identical vectors.
+      if (vectors.length < input.length) {
+        throw new Error(
+          `Embedding API returned ${vectors.length} vectors for ${input.length} input texts. ` +
+          'This is likely a provider bug. Refusing to duplicate vectors to avoid index corruption. ' +
+          'Raw response: ' + JSON.stringify(data).slice(0, 600)
+        );
+      }
+      return vectors.slice(0, input.length);
+    } catch (err) {
+      clearTimeout(timeoutId);
+      if (err.name === 'TypeError' && /Failed to fetch/i.test(err.message)) {
+        const hasPerm = await hasHostPermission(this.embedBaseUrl);
+        if (!hasPerm) {
+          const e = new Error(
+            `Host permission missing for ${this.embedBaseUrl}.\n` +
+            `Chrome needs you to authorize this host once. Open Settings → Vector Search and click "Authorize Embedding Host".`
+          );
+          e.code = 'HOST_PERMISSION_MISSING';
+          e.embedBaseUrl = this.embedBaseUrl;
+          throw e;
+        }
+        throw new Error(`Cannot reach embedding endpoint at ${this.embedBaseUrl} (host permission is granted). Check the URL, API key, and network.`);
+      }
+      throw err;
+    }
   }
 
   async chat(messages, options = {}) {
@@ -88,7 +258,22 @@ export class LlmClient {
    */
   async chatStream(messages, options = {}, onDelta) {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), LLM_TIMEOUT_MS);
+
+    // Use an IDLE timeout instead of a fixed total timeout. Reasoning models
+    // (GLM-4.5/4.6, DeepSeek-R1, QwQ) can generate thinking for 2+ minutes;
+    // a fixed 60s total timeout kills the stream mid-thought, leaving the
+    // user staring at an incomplete "thinking" card. The idle timer resets
+    // on every chunk, so as long as the model is actively producing tokens
+    // the stream stays alive. A hard 5-minute ceiling prevents runaway.
+    const IDLE_TIMEOUT_MS = 30000;
+    const MAX_TOTAL_MS = 300000;
+    let idleTimer = null;
+    const totalTimer = setTimeout(() => controller.abort(), MAX_TOTAL_MS);
+    const resetIdle = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => controller.abort(), IDLE_TIMEOUT_MS);
+    };
+    resetIdle();
 
     try {
       const body = {
@@ -132,6 +317,7 @@ export class LlmClient {
 
       while (true) {
         const { done, value } = await reader.read();
+        resetIdle();
         if (done) break;
         buffer += decoder.decode(value, { stream: true });
 
@@ -172,13 +358,15 @@ export class LlmClient {
         }
       }
 
-      clearTimeout(timeoutId);
+      clearTimeout(idleTimer);
+      clearTimeout(totalTimer);
       const msg = { role: 'assistant', content: contentAcc };
       if (reasoningAcc) msg.reasoning_content = reasoningAcc;
       if (toolCallsAcc.length) msg.tool_calls = toolCallsAcc;
       return msg;
     } catch (err) {
-      clearTimeout(timeoutId);
+      clearTimeout(idleTimer);
+      clearTimeout(totalTimer);
       throw this._wrapError(err);
     }
   }

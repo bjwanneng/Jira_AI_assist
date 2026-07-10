@@ -70,6 +70,10 @@ export class ChatUI {
     // remove it on unmount, but in practice the ChatUI lives as long as the
     // tab, so we leave it attached.
     this._deltaListener = (message, sender, sendResponse) => {
+      if (message.type === MESSAGE_TYPES.CHAT_DONE) {
+        this.finalizeResponse(message.payload || {});
+        return false;
+      }
       if (message.type !== MESSAGE_TYPES.CHAT_DELTA) return false;
       this.handleStreamDelta(message.payload || {});
       return false;
@@ -150,21 +154,32 @@ export class ChatUI {
     const placeholder = this.addThinkingPlaceholder();
     this.activeStreamState = { placeholder, currentEl: null, text: '', round: 0 };
 
-    try {
-      const response = await chrome.runtime.sendMessage({
-        type: MESSAGE_TYPES.CHAT_MESSAGE,
-        payload: {
-          message: text,
-          issueKey: this.issueKey,
-          pageUrl: location.href
-        }
-      });
+    // Fire the query and return. The final result arrives as a SEPARATE
+    // one-way CHAT_DONE message (see _deltaListener) instead of a
+    // long-lived sendResponse — otherwise the result channel can be killed
+    // mid-query (MV3 SW reclamation, or this Jira tab being torn down)
+    // and Chrome logs "message channel closed before a response was received".
+    chrome.runtime.sendMessage({
+      type: MESSAGE_TYPES.CHAT_MESSAGE,
+      payload: {
+        message: text,
+        issueKey: this.issueKey,
+        pageUrl: location.href
+      }
+    }).catch(() => {});
+  }
 
-      if (response.success) {
-        this.renderResponse(response.data, placeholder);
+  // Finalize a query once the background SW delivers CHAT_DONE. Mirrors the
+  // old sendResponse(.data) handling, now driven by a one-way message so
+  // there is no fragile long-lived response channel.
+  finalizeResponse(payload) {
+    const placeholder = this.activeStreamState?.placeholder;
+    try {
+      if (payload.success) {
+        this.renderResponse(payload.data || {}, placeholder);
       } else {
-        const errObj = response.error || {};
-        const errMsg = normalizeErrMsg(errObj.message || response.error, 'Unknown error');
+        const errObj = payload.error || {};
+        const errMsg = normalizeErrMsg(errObj.message || payload.error, 'Unknown error');
         if (errObj.code === 'HOST_PERMISSION_MISSING' || isHostPermissionError(errMsg)) {
           const url = errObj.llmBaseUrl || extractUrlFromPermissionError(errMsg);
           this.addHostPermissionError(errMsg, url);

@@ -13,6 +13,23 @@ import { extractSources } from '../shared/source-tracker.js';
 // in normal use.
 const PATHOLOGICAL_SAFETY_NET = 100;
 
+/**
+ * Cap the size of a tool result before feeding it back into the model context.
+ * Large results (find_similar_issues, search_jira, read_url) can otherwise
+ * balloon the conversation history across many tool rounds and blow the token
+ * budget. The full result is still kept in `toolCalls` for the UI.
+ */
+function compactToolResult(result, maxChars = 6000) {
+  let str;
+  try {
+    str = JSON.stringify(result, null, 2);
+  } catch {
+    str = String(result);
+  }
+  if (str.length <= maxChars) return str;
+  return str.slice(0, maxChars) + `\n... [tool result truncated; ${str.length - maxChars} extra chars omitted] ...`;
+}
+
 // MV3 service workers are killed by Chrome after ~30s of idleness, wiping
 // in-memory state. Persist conversation history + loaded context to
 // chrome.storage.local so the assistant "remembers" across restarts.
@@ -230,14 +247,22 @@ export class ChatOrchestrator {
           continue;
         }
         try {
-          const result = await this.executor.execute(call.name, call.arguments || {});
+          // Wrap tool execution with a timeout so a slow/hung tool (e.g.
+          // embedding endpoint unreachable) doesn't freeze the chat forever.
+          const TOOL_TIMEOUT_MS = 120000; // 2 min per tool call
+          const result = await Promise.race([
+            this.executor.execute(call.name, call.arguments || {}),
+            new Promise((_, reject) =>
+              setTimeout(() => reject(new Error(`Tool ${call.name} timed out after ${TOOL_TIMEOUT_MS / 1000}s`)), TOOL_TIMEOUT_MS)
+            )
+          ]);
           toolEntry.result = result;
           // Collect citable sources from this tool result.
           const srcs = extractSources(call.name, call.arguments || {}, result, this.config.jiraBaseUrl);
           collectedSources.push(...srcs);
           this.conversationHistory.push({
             role: 'user',
-            content: `Tool ${call.name} result: ${JSON.stringify(result, null, 2)}`
+            content: `Tool ${call.name} result: ${compactToolResult(result)}`
           });
         } catch (err) {
           toolEntry.error = err.message;
@@ -264,7 +289,7 @@ export class ChatOrchestrator {
     const confluence = this.executor.cache.get('confluencePages') || [];
     const systemContext = buildInitialContext(issueKey, context, related, confluence);
     const messages = [
-      { role: 'system', content: buildSystemPrompt() },
+      { role: 'system', content: buildSystemPrompt({ ...this.config, sourceFlags: this.sourceFlags }) },
       { role: 'system', content: `Available context:\n${systemContext}` },
       ...this.conversationHistory
     ];

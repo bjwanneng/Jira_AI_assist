@@ -18,9 +18,9 @@ export const TOOLS = [
   },
   {
     name: 'search_jira',
-    description: 'Search Jira issues using natural language or JQL. Uses fuzzy matching: pass keywords or a question; the system strips stopwords and applies prefix wildcards so "auth" matches "authentication". Optionally narrow by project / status / issueType.',
+    description: 'Search Jira issues using natural language or JQL. Uses fuzzy matching with domain-aware expansion: pass keywords or a question; the system strips stopwords, expands chip-design abbreviations (PD=Physical Design, STA=timing analysis, CDC=clock domain crossing, DFT=design for test, etc.), and applies prefix wildcards. Optionally narrow by project / status / issueType.',
     parameters: {
-      query: { type: 'string', description: 'Natural language query or raw JQL. Examples: "BEU interrupt", "memory leak", or jql: "project = PROJ AND status = Open"' },
+      query: { type: 'string', description: 'Natural language query or raw JQL. Examples: "BEU interrupt", "PD timing violation", "CDC metastability", or jql: "project = PROJ AND status = Open"' },
       project: { type: 'string', description: 'Optional project key, e.g. "PROJ". Uppercased automatically.' },
       status: { type: 'string', description: 'Optional status name, e.g. "Open", "In Progress", "Resolved"' },
       issueType: { type: 'string', description: 'Optional issue type, e.g. "Bug", "Support", "Story", "Task"' },
@@ -136,6 +136,31 @@ export function buildSystemPrompt(config = {}) {
   const enabledSources = Object.entries(flags).filter(([, v]) => v).map(([k]) => k).join(', ');
 
   return `You are a technical support analyst assistant with access to Jira, Confluence, Slack, Google Drive, and the web. Your job is to help the user understand customer tickets, find related context, read web pages, and draft replies.
+
+This is a chip-design / RISC-V / EDA support context. Users will reference domain abbreviations - always expand them when forming search queries:
+  PD = Physical Design (floorplan, placement, P&R, routing, timing closure, ECO)
+  STA = Static Timing Analysis (setup, hold, slack, TNS, WNS)
+  CDC = Clock Domain Crossing (metastability, async)
+  DFT = Design for Test (scan, ATPG, BIST, JTAG)
+  APR = Automatic Place and Route
+  CTS = Clock Tree Synthesis
+  IR = IR Drop (voltage drop, power grid)
+  EM = Electromigration
+  RTL = Register Transfer Level (Verilog, SystemVerilog)
+  IP = Intellectual Property core (BEU, CLINT, PLIC, Debug, etc.)
+  MMIO = Memory-Mapped I/O
+  SDC = Synopsys Design Constraints
+  UPF = Unified Power Format (power domain, level shifter, isolation)
+  TRNG = True Random Number Generator (ring oscillator, entropy, seed)
+  SoC = System on Chip
+
+When the user asks about "PD tickets", search for: "physical design", "floorplan", "placement", "P&R", "routing", "timing closure" - not just "PD".
+
+IMPORTANT - Customer/Project awareness:
+  Customer names (EHT, AMD, ESWIN, Bytedance, Lanxin, Lisuan, Semiotics, Siliconwaves) are NOT Jira project keys.
+  The Jira project is typically S5CSD. Customer names appear as tags in ticket summaries like "[EHT]" or "[EHT][870CPU]".
+  When searching for a specific customer's tickets, include the customer name in the query text (e.g. "EHT timing violation"), NOT as a project filter.
+  The search system automatically decomposes broad queries into sub-queries covering multiple sub-domains, so a single search_jira call with good keywords is better than multiple manual calls.
 
 ${siteLine}
 

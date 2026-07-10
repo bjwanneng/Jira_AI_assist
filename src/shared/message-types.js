@@ -1,6 +1,12 @@
 export const MESSAGE_TYPES = {
   CHAT_MESSAGE: 'CHAT_MESSAGE',
   CHAT_DELTA: 'CHAT_DELTA',
+  // Final result for a CHAT_MESSAGE. Delivered as a separate one-way
+  // message (fire-and-forget) instead of sendResponse, so the result channel
+  // is NOT a long-lived sendResponse that can die mid-query (MV3 SW / sender
+  // reclamation) and trigger the "message channel closed before a response
+  // was received" warning.
+  CHAT_DONE: 'CHAT_DONE',
   RESET_CONVERSATION: 'RESET_CONVERSATION',
   CLEAR_ALL_CONVERSATIONS: 'CLEAR_ALL_CONVERSATIONS',
   GET_SETTINGS: 'GET_SETTINGS',
@@ -8,4 +14,10 @@ export const MESSAGE_TYPES = {
   TEST_LLM_CONNECTION: 'TEST_LLM_CONNECTION',
   GET_CHAT_CONTEXT: 'GET_CHAT_CONTEXT',
   WEEKLY_SUMMARY: 'WEEKLY_SUMMARY',
+  TEST_EMBEDDING_CONNECTION: 'TEST_EMBEDDING_CONNECTION',
+  BUILD_EMBEDDING_INDEX: 'BUILD_EMBEDDING_INDEX',
+  CLEAR_EMBEDDING_INDEX: 'CLEAR_EMBEDDING_INDEX',
+  SYNC_EMBEDDING_INDEX: 'SYNC_EMBEDDING_INDEX',
+  COUNT_INDEX_SCOPE: 'COUNT_INDEX_SCOPE',
+  EMBEDDING_INDEX_PROGRESS: 'EMBEDDING_INDEX_PROGRESS',
 };

@@ -69,6 +69,21 @@ export async function appendMessage(id, message) {
   return conversations[idx];
 }
 
+export async function removeLastMessage(id, role) {
+  const conversations = await listConversations();
+  const idx = conversations.findIndex(c => c.id === id);
+  if (idx === -1) return null;
+  const msgs = conversations[idx].messages;
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (msgs[i].role === role) {
+      msgs.splice(i, 1);
+      break;
+    }
+  }
+  await saveConversations(conversations);
+  return conversations[idx];
+}
+
 export async function deleteConversation(id) {
   const conversations = await listConversations();
   const filtered = conversations.filter(c => c.id !== id);

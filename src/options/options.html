@@ -96,11 +96,123 @@
           <strong>config</strong> (W3K, FA7, ...), and <strong>customer</strong> (general or company name).
           The assistant auto-loads relevant docs based on the conversation context.
         </p>
+      </section>
+
+      <section>
+        <h2>Vector Search (Embedding)</h2>
+        <p class="hint" style="margin-bottom: 12px;">
+          Powers <strong>semantic</strong> "find similar tickets" — matches tickets by
+          <em>meaning</em>, not just keyword overlap. Configure a separate embedding
+          endpoint here, independent of the chat LLM above. For example: chat on Kimi,
+          but embed on <strong>Zhipu embedding-3</strong>
+          (<code>https://open.bigmodel.cn/api/paas/v4</code>, model <code>embedding-3</code>).
+          <br><br>
+          <strong>Volcengine Ark note:</strong> you must create an <em>Endpoint</em> for the
+          embedding model in the Ark console and paste its <strong>Endpoint ID</strong>
+          (<code>ep-xxxx…</code>) as the model name below — the raw model name
+          (e.g. <code>doubao-embedding-vision-251215</code>) is rejected with
+          "does not support this api". For text tickets a plain <strong>text</strong> model
+          (<code>doubao-embedding-text-240715</code>) on the
+          <strong>OpenAI-compatible</strong> style is simplest.
+        </p>
         <label>
-          Embedding model (OpenAI-compatible)
-          <input type="text" name="embeddingModel" placeholder="text-embedding-3-small">
-          <span class="hint">Used when your LLM endpoint supports <code>/embeddings</code>. Defaults to <code>text-embedding-3-small</code> (1536 dim, ~$0.02 per 1M tokens).</span>
+          Recall strategy (how "find similar" retrieves)
+          <select name="recallStrategy">
+            <option value="vector-primary">Vector first, JQL fallback (default)</option>
+            <option value="vector">Vector only (no keyword fallback)</option>
+            <option value="jql">Keyword / JQL only (legacy)</option>
+          </select>
+          <span class="hint">
+            <strong>Vector first</strong>: semantic match is primary; if it returns too few neighbours the legacy keyword search fills the gaps.
+            <strong>Vector only</strong>: pure semantic — if the index is empty or weak, you get no results (good for testing embeddings).
+            <strong>Keyword only</strong>: the original keyword approach, ignores the vector index.
+          </span>
         </label>
+        <label>
+          Embedding API style
+          <select name="embedApiStyle">
+            <option value="openai">OpenAI-compatible (/embeddings, plain text)</option>
+            <option value="ark-multimodal">Volcengine Ark multimodal (/embeddings/multimodal)</option>
+          </select>
+          <span class="hint">
+            Pick <strong>OpenAI-compatible</strong> for OpenAI, Zhipu embedding-3, Ollama, <strong>and Ark <em>text</em> models</strong> (e.g. <code>doubao-embedding-text-240715</code> — uses <code>/embeddings</code>).
+            Pick <strong>Ark multimodal</strong> only for Volcengine Ark <code>doubao-embedding-vision</code> models —
+            those require the <code>/embeddings/multimodal</code> path and a structured <code>input</code> (text is still wrapped as <code>{ type: "text", text }</code>). In both cases the <strong>model</strong> field must be the Ark <em>Endpoint ID</em> (<code>ep-xxxx…</code>), not the public model name.
+          </span>
+        </label>
+        <label>
+          Embedding base URL
+          <input type="url" name="embedBaseUrl" placeholder="https://api.openai.com/v1">
+          <span class="hint">OpenAI-compatible <code>/embeddings</code> endpoint. Leave blank to reuse the chat LLM's Base URL above.</span>
+        </label>
+        <label>
+          Embedding API key
+          <input type="password" name="embedApiKey" placeholder="sk-... or Zhipu key">
+          <span class="hint">Leave blank to reuse the chat LLM's API key above.</span>
+        </label>
+        <label>
+          Embedding model
+          <input type="text" name="embeddingModel" placeholder="text-embedding-3-small">
+          <span class="hint">Defaults to <code>text-embedding-3-small</code>. For Zhipu use <code>embedding-3</code> (set Dimensions below to 1024 or 2048). For <strong>Ark, paste the Endpoint ID</strong> (<code>ep-xxxx…</code>) you created for the embedding model — not the public model name. All tickets MUST use this same model so vectors are comparable.</span>
+        </label>
+        <label>
+          Dimensions (0 = model default)
+          <input type="number" name="embedDims" placeholder="0 = default" min="0" max="4096" value="0">
+          <span class="hint">0 lets the model pick its default (1536 for text-embedding-3-small, 1024/2048 for embedding-3). Set a fixed value only if your provider supports a <code>dimensions</code> parameter. Must stay constant across all indexed tickets.</span>
+        </label>
+        <button type="button" id="authorize-embed" class="secondary">Authorize Embedding Host</button>
+        <button type="button" id="test-embed" class="secondary">Test Embedding Connection</button>
+        <span id="embed-status" class="status"></span>
+        <hr style="margin: 16px 0; border: none; border-top: 1px solid var(--border, #ddd);">
+        <p class="hint" style="margin-bottom: 8px;">
+          Build a local similarity index of your Jira tickets so "find similar" can run
+          semantic search. Indexed vectors are stored <strong>only in your browser</strong>
+          (IndexedDB) — nothing is uploaded except the embed calls to the endpoint above.
+        </p>
+        <fieldset style="border:1px solid var(--border,#ddd); border-radius:8px; padding:12px 14px; margin:4px 0 12px;">
+          <legend style="padding:0 6px; font-weight:600;">Build scope (what gets indexed)</legend>
+          <label>
+            Time range
+            <select name="indexLookbackDays" id="index-lookback">
+              <option value="0">All time</option>
+              <option value="7">Last 7 days</option>
+              <option value="30">Last 30 days</option>
+              <option value="90">Last 90 days</option>
+              <option value="180">Last 180 days</option>
+              <option value="365">Last 365 days</option>
+              <option value="730">Last 1 year</option>
+              <option value="1095">Last 2 years</option>
+              <option value="1460">Last 3 years</option>
+              <option value="1825">Last 4 years</option>
+              <option value="2190">Last 5 years</option>
+            </select>
+            <span class="hint">Only tickets updated within this window are indexed. Smaller window = fewer embed calls (cheaper) and a more focused index.</span>
+          </label>
+          <label>
+            Max tickets to embed
+            <input type="number" name="indexMaxIssues" min="10" max="5000" value="2000">
+            <span class="hint">Hard cap 5000. The most recently updated tickets are indexed first, so lowering this keeps the freshest subset.</span>
+          </label>
+          <label>
+            Projects (optional, comma-separated)
+            <input type="text" name="indexProjects" placeholder="e.g. PROJ,SUPP,OPS">
+            <span class="hint">Leave blank to index every project you can see. Useful when you only triage one or two projects.</span>
+          </label>
+          <label>
+            Statuses (optional, comma-separated)
+            <input type="text" name="indexStatuses" placeholder="e.g. Done,Closed">
+            <span class="hint">Leave blank for all statuses. Index only resolved tickets for a cleaner similarity baseline, or only open ones.</span>
+          </label>
+        </fieldset>
+        <button type="button" id="count-scope" class="secondary">List matching tickets</button>
+        <label style="display:inline-flex;align-items:center;gap:4px;margin-left:8px;font-size:12px;color:var(--fg,#222);" title="Paginate every matching ticket for the true count. Slower (can take a minute on large scopes) but not approximate.">
+          <input type="checkbox" id="count-exact"> Exact (slower, paginates)
+        </label>
+        <button type="button" id="build-index" class="secondary">Build Similarity Index</button>
+        <button type="button" id="sync-index" class="secondary">Sync New Tickets</button>
+        <button type="button" id="clear-index" class="secondary">Clear Index</button>
+        <span id="index-status" class="status"></span>
+        <progress id="index-progress" value="0" max="100" style="width:100%; display:none; margin-top:8px;"></progress>
       </section>
 
       <section>

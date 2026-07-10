@@ -6,12 +6,7 @@
   "permissions": [
     "storage",
     "unlimitedStorage",
-    "activeTab",
-    "scripting",
     "identity"
-  ],
-  "optional_permissions": [
-    "background"
   ],
   "optional_host_permissions": [
     "http://*/",
@@ -31,7 +26,8 @@
     "https://*.jira.com/*",
     "https://slack.com/*",
     "https://*.slack.com/*",
-    "https://www.googleapis.com/*"
+    "https://www.googleapis.com/*",
+    "https://sheets.googleapis.com/*"
   ],
   "background": {
     "service_worker": "src/background/service-worker.js",

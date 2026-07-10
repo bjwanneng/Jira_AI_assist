@@ -408,7 +408,7 @@ export class ToolExecutor {
     // or expansion fails.
     const expansion = this.llm ? await getOrExpand(query, this.llm) : null;
 
-    if (!expansion || (!expansion.primaryTerms?.length && !expansion.synonyms?.length)) {
+    if (!expansion || !expansion.subQueries?.length) {
       const jql = buildFuzzyJql(query, { project, status, issueType });
       const result = await this.api.searchJira(jql, maxResults);
       return {
@@ -429,24 +429,19 @@ export class ToolExecutor {
     if (issueType) filterClauses.push(`issuetype = "${String(issueType).replace(/"/g, '\\"')}"`);
     const filterStr = filterClauses.length ? ' AND ' + filterClauses.join(' AND ') : '';
 
+    // Build JQL channels: 2 per sub-query (primaryTerms + synonyms).
+    const subQueries = expansion.subQueries;
     const channels = [];
-    if (expansion.primaryTerms?.length) {
-      const textOr = expansion.primaryTerms
-        .map((t) => buildJqlTextClause(t))
-        .join(' OR ');
-      channels.push({
-        tier: 1,
-        jql: `(${textOr})${filterStr} ORDER BY updated DESC`
-      });
-    }
-    if (expansion.synonyms?.length) {
-      const textOr = expansion.synonyms
-        .map((t) => buildJqlTextClause(t))
-        .join(' OR ');
-      channels.push({
-        tier: 2,
-        jql: `(${textOr})${filterStr} ORDER BY updated DESC`
-      });
+    for (let si = 0; si < subQueries.length; si++) {
+      const sq = subQueries[si];
+      if (sq.primaryTerms?.length) {
+        const textOr = sq.primaryTerms.map((t) => buildJqlTextClause(t)).join(' OR ');
+        channels.push({ tier: 1, subIndex: si, jql: `(${textOr})${filterStr} ORDER BY updated DESC` });
+      }
+      if (sq.synonyms?.length) {
+        const textOr = sq.synonyms.map((t) => buildJqlTextClause(t)).join(' OR ');
+        channels.push({ tier: 2, subIndex: si, jql: `(${textOr})${filterStr} ORDER BY updated DESC` });
+      }
     }
 
     if (channels.length === 0) {
@@ -462,23 +457,60 @@ export class ToolExecutor {
       };
     }
 
-    // Run channels in parallel, tolerate failures.
-    const settled = await Promise.allSettled(
-      channels.map(async (c) => {
+    // Vector search: one embed of the original query, cosine search.
+    // Runs in parallel with all JQL channels.
+    const vectorEnabled = Boolean(this.llm?.isEmbeddingEnabled);
+    const vectorCount = vectorEnabled ? await indexCount() : 0;
+    const shouldRunVector = vectorEnabled && vectorCount > 0;
+
+    console.log('[search_jira] query=%s subQueries=%d channels=%d vector=%s', query, subQueries.length, channels.length, shouldRunVector);
+
+    const allTasks = channels.map(async (c) => {
         const res = await this.api.searchJira(c.jql, MAX_RERANK_CANDIDATES);
         return { tier: c.tier, issues: res.issues || [] };
-      })
-    );
+      });
+
+    if (shouldRunVector) {
+      allTasks.push((async () => {
+        const [queryVec] = await this.llm.embed(query);
+        const hits = await vectorSearch(queryVec, {
+          topK: VECTOR_TOP_K,
+          queryModel: this.llm.embedModel
+        });
+        return {
+          tier: 0,
+          issues: hits.map((h) => ({
+            key: h.key,
+            fields: {
+              summary: h.meta?.summary || '',
+              status: h.meta?.status ? { name: h.meta.status } : undefined,
+              issuetype: h.meta?.issueType ? { name: h.meta.issueType } : undefined,
+              priority: h.meta?.priority ? { name: h.meta.priority } : undefined,
+              updated: h.meta?.updated || null
+            },
+            _vecScore: h.score
+          }))
+        };
+      })());
+    }
+
+    const settled = await Promise.allSettled(allTasks);
 
     const rankedLists = [];
     const tierByKey = new Map();
+    let vectorRecall = 0;
+    let totalJqlHits = 0;
     for (const r of settled) {
       if (r.status !== 'fulfilled' || !r.value.issues.length) continue;
+      if (r.value.tier === 0) vectorRecall = r.value.issues.length;
+      else totalJqlHits += r.value.issues.length;
       rankedLists.push(r.value.issues);
       for (const it of r.value.issues) {
         if (!tierByKey.has(it.key)) tierByKey.set(it.key, r.value.tier);
       }
     }
+
+    console.log('[search_jira] retrieval done: jqlHits=%d vecHits=%d rankedLists=%d', totalJqlHits, vectorRecall, rankedLists.length);
 
     if (rankedLists.length === 0) {
       return {
@@ -487,17 +519,23 @@ export class ToolExecutor {
         issues: [],
         total: 0,
         reranked: false,
-        reason: 'all_channels_empty'
+        reason: 'all_channels_empty',
+        subQueryCount: subQueries.length,
+        vectorEnabled,
+        vectorIndexCount: vectorCount,
+        vectorRecall
       };
     }
 
-    // RRF merge → top-20 candidates.
+    // RRF merge -> top candidates.
     const fused = reciprocalRankFusion(rankedLists, { k: RRF_K, keyFn: (it) => it.key });
     const candidates = fused.map((entry) => ({
       ...entry.item,
       _rrfScore: entry.score,
       _tier: tierByKey.get(entry.item.key) ?? 99
     })).slice(0, MAX_RERANK_CANDIDATES);
+
+    console.log('[search_jira] RRF fused: %d unique candidates, reranking top %d...', candidates.length, Math.min(MAX_RERANKED_RESULTS, maxResults));
 
     // Rerank with LLM. Source = { query, expansion } so the reranker prompt
     // has the user's intent + extracted terms.
@@ -532,7 +570,12 @@ export class ToolExecutor {
       total: candidates.length,
       candidatesBeforeRerank: candidates.length,
       channels: channels.map((c) => ({ tier: c.tier, jql: c.jql })),
-      reranked: Boolean(this.llm)
+      reranked: Boolean(this.llm),
+      subQueryCount: subQueries.length,
+      subQueryFocuses: subQueries.map((sq) => sq.focus),
+      vectorEnabled,
+      vectorIndexCount: vectorCount,
+      vectorRecall
     };
   }
 
@@ -624,10 +667,10 @@ export class ToolExecutor {
     }
 
     try {
-      // Get LLM-extracted structured summary (cached in IndexedDB).
-      // Falls back to null if LLM is unavailable — searchRelatedIssues then
-      // takes the legacy tier-cascade path.
+      console.log('[find_similar] start for', issueKey);
+      const t0 = Date.now();
       const summary = this.llm ? await getOrSummarize(issue, this.llm) : null;
+      console.log('[find_similar] summarize done:', `${Date.now() - t0}ms`, summary ? 'OK' : 'null');
 
       const result = await this.api.searchRelatedIssues(issue, {
         summary,
@@ -636,14 +679,17 @@ export class ToolExecutor {
       });
 
       const candidates = result.issues || [];
+      console.log('[find_similar] JQL done:', `${Date.now() - t0}ms`, `issues=${candidates.length}`);
 
       // Rerank with LLM. Falls back to RRF order if LLM unavailable or fails.
+      const tRerank = Date.now();
       const ranked = await rerankCandidates(
         summary ? { summary, issueKey: issue.key } : { issueKey: issue.key },
         candidates,
         this.llm,
         { topN: MAX_RERANKED_RESULTS }
       );
+      console.log('[find_similar] rerank done:', `${Date.now() - tRerank}ms`, `ranked=${ranked.length}`, `total=${Date.now() - t0}ms`);
 
       // Build the user-facing issue list. Map rerank results back to full
       // issue fields so the existing simplifySearchResults shape carries

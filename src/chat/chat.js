@@ -5,7 +5,7 @@ import { ContextState } from '../shared/context-state.js';
 import {
   listConversations, createConversation, getConversation,
   updateConversation, appendMessage, deleteConversation,
-  clearAllConversations, getActiveConversationId, setActiveConversationId
+  removeLastMessage, clearAllConversations, getActiveConversationId, setActiveConversationId
 } from './conversation-store.js';
 import { requestHostPermission, isHostPermissionError, extractUrlFromPermissionError } from '../shared/permissions.js';
 
@@ -45,6 +45,11 @@ let activeConversationId = null;
 let activeStreamState = null;
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.type === MESSAGE_TYPES.CHAT_DONE) {
+    // The query finished in the background SW; render its final result.
+    finalizeChat(message.payload || {});
+    return false;
+  }
   if (message.type !== MESSAGE_TYPES.CHAT_DELTA) return false;
   const payload = message.payload || {};
   // Ignore deltas for other conversations (e.g. another open chat tab).
@@ -81,6 +86,10 @@ function handleStreamDelta(payload) {
 // ---------- Conversation management ----------
 
 async function startNewConversation() {
+  // Hide weekly view if visible - switching to chat should always show messages.
+  weeklyView.classList.add('hidden');
+  messagesContainer.classList.remove('hidden');
+
   // Read current source flags from the UI before creating.
   const sourceFlags = collectSourceFlags();
   const conv = await createConversation('New conversation', { sourceFlags });
@@ -133,6 +142,10 @@ async function clearBackendConversations() {
 async function switchConversation(id) {
   const conv = await getConversation(id);
   if (!conv) return;
+  // Hide weekly view if visible - switching to chat should always show messages.
+  weeklyView.classList.add('hidden');
+  messagesContainer.classList.remove('hidden');
+
   activeConversationId = id;
   await setActiveConversationId(id);
 
@@ -218,20 +231,32 @@ async function onSend() {
   activeStreamState = { placeholder, currentEl: null, text: '', round: 0 };
   renderHistory();
 
-  try {
-    const response = await chrome.runtime.sendMessage({
-      type: MESSAGE_TYPES.CHAT_MESSAGE,
-      payload: {
-        message: text,
-        issueKey: null,
-        pageUrl: location.href,
-        conversationId: activeConversationId,
-        sourceFlags: collectSourceFlags()
-      }
-    });
+  // Fire the query and return. The final result arrives as a SEPARATE
+  // one-way CHAT_DONE message (see the onMessage listener below) instead of
+  // a long-lived sendResponse — otherwise the result channel can be killed
+  // mid-query (MV3 SW reclamation, or the Jira tab context being torn
+  // down) and Chrome logs "message channel closed before a response was
+  // received".
+  chrome.runtime.sendMessage({
+    type: MESSAGE_TYPES.CHAT_MESSAGE,
+    payload: {
+      message: text,
+      issueKey: null,
+      pageUrl: location.href,
+      conversationId: activeConversationId,
+      sourceFlags: collectSourceFlags()
+    }
+  }).catch(() => {});
+}
 
-    if (response?.success) {
-      const data = response.data || {};
+// Finalize a query once the background SW delivers CHAT_DONE. This mirrors
+// the old sendResponse(.data) handling but is now driven by a one-way
+// message, so there is no fragile long-lived response channel.
+async function finalizeChat(payload) {
+  const placeholder = activeStreamState?.placeholder;
+  try {
+    if (payload?.success) {
+      const data = payload.data || {};
       let sawStreamedReasoning = false;
       if (Array.isArray(data.toolCalls)) {
         for (const tool of data.toolCalls) {
@@ -285,8 +310,8 @@ async function onSend() {
       refreshContextDisplay();
       renderHistory();
     } else {
-      const errObj = response?.error || {};
-      const errMsg = normalizeErrMsg(errObj.message || response?.error, 'Unknown error');
+      const errObj = payload?.error || {};
+      const errMsg = normalizeErrMsg(errObj.message || payload?.error, 'Unknown error');
       if (errObj.code === 'HOST_PERMISSION_MISSING' || isHostPermissionError(errMsg)) {
         const url = errObj.llmBaseUrl || extractUrlFromPermissionError(errMsg);
         addHostPermissionError(errMsg, url);
@@ -328,20 +353,24 @@ async function authorizeLlmHost(url, btn) {
       btn.textContent = 'Authorized ✓ Retrying last message...';
       // Remove the error message and re-send the last user message
       const errorEl = btn.closest('.message');
-      if (errorEl) errorEl.remove();
-      // Resend
+      // Drop the error bubble from the DOM, plus the user bubble directly
+      // before it (appended in the same failed send), so the retry below
+      // does not create a duplicate in either the UI or the store.
+      if (errorEl) {
+        const userEl = errorEl.previousElementSibling;
+        if (userEl && userEl.classList.contains('user')) userEl.remove();
+        errorEl.remove();
+      }
+      // Strip the trailing error + user messages that the failed send added
+      // to the persisted store, then re-trigger send so onSend appends the
+      // user turn exactly once.
+      await removeLastMessage(activeConversationId, 'error');
+      await removeLastMessage(activeConversationId, 'user');
       const lastConv = await getConversation(activeConversationId);
-      if (lastConv?.messages?.length) {
-        // Pop the last user message back into the input and send
-        const lastUser = [...lastConv.messages].reverse().find(m => m.role === 'user');
-        if (lastUser) {
-          // Remove it from history so we don't duplicate
-          // (the onSend will re-append)
-          await appendMessage(activeConversationId, { role: 'user', content: lastUser.content });
-          // Just re-trigger send with the same text
-          inputEl.value = lastUser.content;
-          await onSend();
-        }
+      const lastUser = [...(lastConv?.messages || [])].reverse().find(m => m.role === 'user');
+      if (lastUser) {
+        inputEl.value = lastUser.content;
+        await onSend();
       }
     } else {
       btn.textContent = 'Permission denied. Click to retry.';
@@ -503,11 +532,31 @@ function summarizeTool(name, args, result) {
   const argStr = args && Object.keys(args).length ? JSON.stringify(args) : '';
   if (result?.error) return `${argStr} → error: ${result.error}`;
   if (name === 'get_issue' && result?.key) return `${result.key}: ${result.summary}`;
-  if (name === 'search_jira' && result?.issues) return `${argStr} → ${result.issues.length} issues`;
+  if (name === 'search_jira' && result?.issues) {
+    const n = result.issues.length;
+    const subInfo = result.subQueryCount > 1 ? ` · ${result.subQueryCount} sub-queries` : '';
+    const vecInfo = result.vectorEnabled
+      ? ` · index:${result.vectorIndexCount}${result.vectorRecall ? ` · vecRecall:${result.vectorRecall}` : ''}`
+      : '';
+    return `${argStr} -> ${n} issues${subInfo}${vecInfo}`;
+  }
   if (name === 'search_confluence' && result?.pages) return `${argStr} → ${result.pages.length} pages`;
   if (name === 'search_slack' && result?.messages) return `${argStr} → ${result.messages.length} messages`;
   if (name === 'search_drive' && result?.files) return `${argStr} → ${result.files.length} files`;
-  if (name === 'find_similar_issues' && result?.issues) return `${argStr} → ${result.issues.length} similar issues`;
+  if (name === 'find_similar_issues' && result?.issues) {
+    const n = result.issues.length;
+    const src = result.recallSource;
+    let method = 'unknown';
+    if (src === 'vector') method = 'vector search';
+    else if (src === 'vector+jql') method = 'vector + JQL (hybrid)';
+    else if (src === 'jql-fallback') method = 'JQL keyword fallback';
+    else if (src === 'failed') method = 'failed';
+    const idxInfo = result.vectorEnabled
+      ? ` · index:${result.vectorIndexCount}`
+      : ' · vector OFF';
+    const recallInfo = result.vectorRecall ? ` · vecRecall:${result.vectorRecall}` : '';
+    return `${argStr} → ${n} similar · via ${method}${idxInfo}${recallInfo}`;
+  }
   if (name === 'read_url') return `${result?.url || argStr} → ${result?.title || 'loaded'}`;
   if (name === 'set_context') return `→ ${result.display || 'updated'}`;
   return argStr ? `${argStr} → done` : 'done';

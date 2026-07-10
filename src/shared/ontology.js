@@ -124,13 +124,16 @@ export const DOMAIN_ONTOLOGY = {
   physical: {
     label: 'Physical Design',
     surface: [
-      'floorplan', 'floorplanning',
+      'PD', 'physical design', 'PD signoff',
+      'floorplan', 'floorplanning', 'floorplan design',
       'placement', 'place and route', 'P&R', 'APR',
-      'physical design', 'PD signoff',
       'standard cell', 'hard macro', 'soft macro',
       'IO', 'I/O', 'pad', 'bump',
       'die size', 'core area', 'utilization',
-      'power planning', 'power network'
+      'power planning', 'power network',
+      'routing', 'layout', 'layout design',
+      'ECO routing', 'eco',
+      'timing closure', 'timing clean'
     ]
   },
 
@@ -175,6 +178,90 @@ export const DOMAIN_ONTOLOGY = {
       'virtual memory', 'SVM', 'MMU',
       'debug', 'debug module', 'DebugROM'
     ]
+  },
+
+  sdc: {
+    label: 'SDC / Constraints',
+    surface: [
+      'SDC', 'Synopsys Design Constraints',
+      'constraint', 'constraints file',
+      'create_clock', 'create_generated_clock',
+      'set_input_delay', 'set_output_delay',
+      'set_max_delay', 'set_min_delay',
+      'set_false_path', 'set_multicycle_path',
+      'set_clock_groups', 'set_clock_uncertainty',
+      'CDC bound', 'CDC constraint',
+      'set_disable_timing', 'set_case_analysis',
+      'max_delay', 'min_delay',
+      'timing constraint', 'timing exception'
+    ]
+  },
+
+  upf: {
+    label: 'UPF / Power Intent',
+    surface: [
+      'UPF', 'Unified Power Format',
+      'CPF', 'Common Power Format',
+      'power intent', 'power specification',
+      'VCLP', 'Voltage Aware Logic Synthesis',
+      'power domain', 'power gating', 'PSO',
+      'level shifter', 'isolation cell', 'retention cell',
+      'pg lib', 'power ground library',
+      'supply net', 'supply set',
+      'power state table', 'PST',
+      'always-on', 'switchable'
+    ]
+  },
+
+  trng: {
+    label: 'TRNG / Random Number',
+    surface: [
+      'TRNG', 'True Random Number Generator',
+      'random number', 'random generator',
+      'ring oscillator', 'RO entropy',
+      'entropy', 'entropy source',
+      'seed', 'seed CSR', 'seed control',
+      'CSR', 'divider',
+      'noise source', 'harvester',
+      'DRBG', 'PRNG',
+      'NIST', 'AIS-31'
+    ]
+  },
+
+  synthesis: {
+    label: 'Synthesis / Release Quality',
+    surface: [
+      'synthesis', 'logic synthesis', 'synthesizable',
+      'DC', 'Design Compiler',
+      'empty module', 'black box',
+      'ICG', 'integrated clock gating',
+      'hierarchy', 'hierarchical synthesis',
+      'unconstrained', 'unconstrained paths',
+      'register D pin', 'D pin',
+      'mapping file', 'flop name',
+      'group_path', 'timing group',
+      'obfuscation', 'obfuscated',
+      'release quality', 'release note',
+      'warning', 'synthesis warning',
+      'multi-Vt', 'Vt swap'
+    ]
+  },
+
+  dft_mbist: {
+    label: 'DFT / MBIST',
+    surface: [
+      'MBIST', 'Memory BIST',
+      'MBIF', 'Memory BIST Interface',
+      'lvlib', 'library cell',
+      'tcd', 'test control',
+      'Tessent', 'Tessent MBIST',
+      'ATPG', 'test pattern',
+      'formality', 'formal verification',
+      'scan chain', 'scan insertion',
+      'BIST', 'LBIST',
+      'test mode', 'test pin',
+      'memory test', 'repair', 'redundancy'
+    ]
   }
 };
 
@@ -194,6 +281,25 @@ const CONCEPT_MATCHERS = Object.entries(DOMAIN_ONTOLOGY).map(([key, concept]) =>
   };
 });
 
+// Cross-concept associations. When concept A is detected, also expand to
+// concept B's surface forms. This lets "PD" (physical design) automatically
+// pull in timing, routing, and power concepts - because in chip design
+// these domains are deeply interconnected.
+const CONCEPT_RELATIONS = {
+  physical: ['timing', 'routing', 'power', 'sdc', 'synthesis'],
+  timing: ['physical', 'power', 'sdc'],
+  routing: ['physical', 'timing'],
+  verification: ['functional'],
+  functional: ['verification'],
+  dft: ['manufacturing', 'dft_mbist'],
+  dft_mbist: ['dft', 'manufacturing'],
+  manufacturing: ['physical'],
+  sdc: ['timing', 'physical'],
+  upf: ['power', 'physical'],
+  trng: ['sdc', 'functional'],
+  synthesis: ['physical', 'timing', 'sdc']
+};
+
 /**
  * Detect which domain concepts appear in a text.
  *
@@ -206,6 +312,9 @@ export function detectConcepts(text) {
   for (const matcher of CONCEPT_MATCHERS) {
     if (matcher.regex.test(text)) {
       hits.add(matcher.key);
+      // Expand to related concepts (e.g. PD -> timing + routing + power)
+      const related = CONCEPT_RELATIONS[matcher.key];
+      if (related) for (const r of related) hits.add(r);
     }
   }
   return Array.from(hits);
