@@ -112,77 +112,64 @@ function buildScoreMap(parsed) {
  */
 export async function rerankCandidates(source, candidates, llm, opts = {}) {
   const topN = opts.topN ?? MAX_RERANKED_RESULTS;
-  // Cap the rerank pool to keep the LLM prompt manageable. Each candidate
-  // uses ~50 tokens (key + summary + status). With a 4096 token limit on
-  // cheap models, 40 candidates ≈ 2k tokens for candidates + 1k for prompt
-  // template + source context = ~3k, leaving headroom.
-  const RERANK_POOL_CAP = 50;
-  const pool = (candidates || []).slice(0, Math.min(RERANK_POOL_CAP, candidates.length));
+  const allCandidates = candidates || [];
 
-  // Nothing to rerank — return as-is (sorted by RRF score, no reasons).
-  if (pool.length === 0) return [];
-  if (pool.length === 1) {
-    return [
-      {
-        ...pool[0],
-        score: 100,
-        reason: 'only candidate'
-      }
-    ];
+  if (allCandidates.length === 0) return [];
+  if (allCandidates.length === 1) {
+    return [{ ...allCandidates[0], score: 100, reason: 'only candidate' }];
   }
 
-  // No LLM available — degrade to RRF-only ranking.
+  // No LLM available — degrade to score-only ranking.
   if (!llm) {
-    return pool
+    return allCandidates
       .slice()
       .sort((a, b) => (b._rrfScore || 0) - (a._rrfScore || 0))
       .slice(0, topN)
       .map((c) => ({
-        key: c.key,
-        score: 0,
-        reason: '',
-        _rrfScore: c._rrfScore,
-        _tier: c._tier,
-        fields: c.fields
+        key: c.key, score: 0, reason: '',
+        _rrfScore: c._rrfScore, _tier: c._tier, fields: c.fields
       }));
   }
 
-  try {
-    const response = await llm.chatCheap([
-      { role: 'system', content: RERANKER_SYSTEM_PROMPT },
-      { role: 'user', content: buildRerankerUserPrompt(renderSourceBlock(source), pool) }
-    ]);
-    const scoreMap = buildScoreMap(parseLlmJson(response?.content || ''));
-
-    // Merge scores back into candidate records, carrying through RRF metadata.
-    // Any candidate the LLM omitted gets score 0 (will sort last).
-    const scored = pool.map((c) => {
-      const entry = scoreMap.get(c.key) || { score: 0, reason: '' };
-      return {
-        key: c.key,
-        score: entry.score,
-        reason: entry.reason,
-        _rrfScore: c._rrfScore,
-        _tier: c._tier,
-        fields: c.fields
-      };
-    });
-    scored.sort((a, b) => b.score - a.score || (b._rrfScore || 0) - (a._rrfScore || 0));
-    return scored.slice(0, topN);
-  } catch (err) {
-    console.warn('[reranker] LLM call failed (pool=%d), falling back to RRF order: %s', pool.length, err?.message || err);
-    console.warn('[reranker] error details:', err?.status, err?.code, JSON.stringify(err).slice(0, 200));
-    return pool
-      .slice()
-      .sort((a, b) => (b._rrfScore || 0) - (a._rrfScore || 0))
-      .slice(0, topN)
-      .map((c) => ({
-        key: c.key,
-        score: 0,
-        reason: '',
-        _rrfScore: c._rrfScore,
-        _tier: c._tier,
-        fields: c.fields
-      }));
+  // Process in batches to handle large candidate pools without truncation.
+  // Each batch is small enough for one LLM call (~20 candidates × 50 tokens).
+  // All batches run in parallel, results are merged at the end.
+  const BATCH_SIZE = 20;
+  const batches = [];
+  for (let i = 0; i < allCandidates.length; i += BATCH_SIZE) {
+    batches.push(allCandidates.slice(i, i + BATCH_SIZE));
   }
+
+  console.log('[reranker] %d candidates in %d batches (batch=%d)', allCandidates.length, batches.length, BATCH_SIZE);
+
+  const batchResults = await Promise.all(
+    batches.map(async (batch, batchIdx) => {
+      try {
+        const response = await llm.chatCheap([
+          { role: 'system', content: RERANKER_SYSTEM_PROMPT },
+          { role: 'user', content: buildRerankerUserPrompt(renderSourceBlock(source), batch) }
+        ]);
+        const scoreMap = buildScoreMap(parseLlmJson(response?.content || ''));
+        return batch.map((c) => {
+          const entry = scoreMap.get(c.key) || { score: 0, reason: '' };
+          return {
+            key: c.key, score: entry.score, reason: entry.reason,
+            _rrfScore: c._rrfScore, _tier: c._tier, fields: c.fields
+          };
+        });
+      } catch (err) {
+        console.warn('[reranker] batch %d failed (%d candidates): %s', batchIdx, batch.length, err?.message || err);
+        // Return batch with score 0 so they still appear in results
+        return batch.map((c) => ({
+          key: c.key, score: 0, reason: '',
+          _rrfScore: c._rrfScore, _tier: c._tier, fields: c.fields
+        }));
+      }
+    })
+  );
+
+  // Merge all batch results, sort by score desc then RRF score desc
+  const scored = batchResults.flat();
+  scored.sort((a, b) => b.score - a.score || (b._rrfScore || 0) - (a._rrfScore || 0));
+  return scored.slice(0, topN);
 }
