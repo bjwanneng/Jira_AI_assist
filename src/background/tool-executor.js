@@ -459,7 +459,7 @@ export class ToolExecutor {
 
       // Phase 1: paginated fetch. Jira Cloud's GET search API caps at 100
       // per page regardless of maxResults param, so we loop to get all.
-      const MAX_POOL = 300;
+      const MAX_POOL = 500;
       const t0 = Date.now();
       const pool = [];
       let startAt = 0;
@@ -535,8 +535,39 @@ export class ToolExecutor {
         }
       }
 
-      // Phase 2b: LLM rerank — pick the most relevant tickets from the pool
+      // Phase 2b: LLM rerank — pick the most relevant tickets from the pool.
+      // When pool is large (>20), we can't send all to the LLM (token limit).
+      // Instead, do lightweight keyword pre-scoring to select the top 20 most
+      // relevant candidates, then LLM-rerank those.
       const t2 = Date.now();
+
+      // Collect all search terms from sub-queries for keyword pre-scoring
+      const allSearchTerms = new Set();
+      for (const sq of expansion.subQueries) {
+        [...(sq.primaryTerms || []), ...(sq.synonyms || [])].forEach(t => allSearchTerms.add(t.toLowerCase()));
+      }
+
+      // Pre-score: count how many search terms appear in each ticket's summary
+      if (candidates.length > 20) {
+        candidates = candidates.map(it => {
+          const summary = (it.fields?.summary || '').toLowerCase();
+          let kwScore = 0;
+          for (const term of allSearchTerms) {
+            if (summary.includes(term)) kwScore++;
+          }
+          return { ...it, _kwScore: kwScore };
+        }).sort((a, b) => {
+          // Sort by: keyword score desc, then vector score desc, then updated desc
+          if (b._kwScore !== a._kwScore) return b._kwScore - a._kwScore;
+          if ((b._vecScore || 0) !== (a._vecScore || 0)) return (b._vecScore || 0) - (a._vecScore || 0);
+          return 0; // keep original order (updated DESC)
+        });
+        console.log('[search_jira] Phase 2b: keyword pre-scored %d candidates, top kwScores: %s',
+          candidates.length,
+          candidates.slice(0, 5).map(c => `${c.key}:${c._kwScore}`).join(', ')
+        );
+      }
+
       const simplifiedPool = simplifySearchResults({ issues: candidates });
       const ranked = await rerankCandidates(
         { query, expansion },
