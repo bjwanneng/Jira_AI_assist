@@ -4,7 +4,7 @@ import { ChatOrchestrator } from './chat-orchestrator.js';
 import { LlmClient } from './llm-client.js';
 import { ApiClient, SlackClient } from './api-client.js';
 import { buildWeeklySummary } from './weekly-summary-builder.js';
-import { buildIndex, clearIndex, syncNewIssues, countScope } from './ticket-indexer.js';
+import { buildIndex, clearIndex, syncNewIssues, countScope, indexCount } from './ticket-indexer.js';
 
 const allKeys = Object.values(STORAGE_KEYS);
 
@@ -325,6 +325,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           try {
             await clearIndex();
             return sendResponse({ success: true, count: 0 });
+          } catch (err) {
+            return sendResponse({ success: false, error: err.message });
+          }
+        }
+
+        case MESSAGE_TYPES.GET_INDEX_COUNT: {
+          try {
+            const count = await indexCount();
+            return sendResponse({ success: true, count });
           } catch (err) {
             return sendResponse({ success: false, error: err.message });
           }

@@ -186,6 +186,21 @@ document.getElementById('connect-drive').addEventListener('click', async () => {
 const embedStatus = document.getElementById('embed-status');
 const indexStatus = document.getElementById('index-status');
 const indexProgress = document.getElementById('index-progress');
+const indexCountDisplay = document.getElementById('index-count-display');
+
+async function refreshIndexCount() {
+  if (!indexCountDisplay) return;
+  try {
+    const res = await chrome.runtime.sendMessage({ type: MESSAGE_TYPES.GET_INDEX_COUNT });
+    if (res?.success) {
+      indexCountDisplay.textContent = `Index: ${res.count} tickets`;
+      indexCountDisplay.style.color = res.count > 0 ? '#1a7f37' : '#999';
+    }
+  } catch {}
+}
+
+// Refresh on page load and after index operations
+refreshIndexCount();
 
 /**
  * Resolve the effective embedding base URL (falls back to the chat LLM's
@@ -287,6 +302,7 @@ document.getElementById('build-index').addEventListener('click', async () => {
       const d = response.data || {};
       indexProgress.value = 100;
       showStatus(indexStatus, `Index built: ${d.indexed} tickets embedded${d.skipped ? `, ${d.skipped} skipped` : ''}.`);
+      refreshIndexCount();
     } else {
       showStatus(indexStatus, response?.error || 'Build failed', true);
       indexProgress.style.display = 'none';
@@ -314,6 +330,7 @@ document.getElementById('sync-index').addEventListener('click', async () => {
       const d = response.data || {};
       indexProgress.value = 100;
       showStatus(indexStatus, `Sync done: ${d.synced} new ticket(s) embedded${d.skipped ? `, ${d.skipped} skipped` : ''}.`);
+      refreshIndexCount();
     } else {
       showStatus(indexStatus, response?.error || 'Sync failed', true);
       indexProgress.style.display = 'none';
@@ -330,6 +347,7 @@ document.getElementById('clear-index').addEventListener('click', async () => {
     const response = await chrome.runtime.sendMessage({ type: MESSAGE_TYPES.CLEAR_EMBEDDING_INDEX });
     if (response && response.success) {
       showStatus(indexStatus, `Index cleared (${response.count ?? 0} tickets removed).`);
+      refreshIndexCount();
     } else {
       showStatus(indexStatus, response?.error || 'Clear failed', true);
     }
