@@ -457,10 +457,24 @@ export class ToolExecutor {
       if (issueType) phase1Clauses.push(`issuetype = "${String(issueType).replace(/"/g, '\\"')}"`);
       const phase1Jql = phase1Clauses.join(' AND ') + ' ORDER BY updated DESC';
 
+      // Phase 1: paginated fetch. Jira Cloud's GET search API caps at 100
+      // per page regardless of maxResults param, so we loop to get all.
+      const MAX_POOL = 300;
       const t0 = Date.now();
-      const phase1Res = await this.api.searchJira(phase1Jql, 200); // cap at 200
-      const pool = phase1Res.issues || [];
-      console.log('[search_jira] Phase 1: %d tickets fetched in %dms', pool.length, Date.now() - t0);
+      const pool = [];
+      let startAt = 0;
+      let total = 0;
+      while (pool.length < MAX_POOL) {
+        const PAGE_SIZE = 100;
+        const res = await this.api.searchJira(phase1Jql, PAGE_SIZE, startAt);
+        total = res.total || total;
+        const issues = res.issues || [];
+        if (issues.length === 0) break;
+        pool.push(...issues);
+        if (issues.length < PAGE_SIZE || pool.length >= total) break;
+        startAt += issues.length;
+      }
+      console.log('[search_jira] Phase 1: %d/%d tickets fetched in %dms', pool.length, total, Date.now() - t0);
 
       if (pool.length === 0) {
         return {
