@@ -24,7 +24,7 @@ export const TOOLS = [
       project: { type: 'string', description: 'Optional project key, e.g. "PROJ". Uppercased automatically.' },
       status: { type: 'string', description: 'Optional status name, e.g. "Open", "In Progress", "Resolved"' },
       issueType: { type: 'string', description: 'Optional issue type, e.g. "Bug", "Support", "Story", "Task"' },
-      maxResults: { type: 'number', description: 'Optional cap, default 10' }
+      maxResults: { type: 'number', description: 'Optional cap on number of results. Default 50. Use higher values (100-200) for broad searches that need to cover many tickets.' }
     }
   },
   {
@@ -58,7 +58,7 @@ export const TOOLS = [
     description: 'Search Google Drive files by name or full-text content. Returns matching files (Docs, Sheets, PDFs, plain text). Use this when the user references a Google Doc, design spec, or internal doc stored in Drive.',
     parameters: {
       query: { type: 'string', description: 'Search query — matches file name or full content' },
-      maxResults: { type: 'number', description: 'Optional cap, default 10' }
+      maxResults: { type: 'number', description: 'Optional cap on number of results. Default 50. Use higher values (100-200) for broad searches that need to cover many tickets.' }
     }
   },
   {

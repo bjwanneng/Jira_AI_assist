@@ -387,7 +387,7 @@ export class ToolExecutor {
     const project = typeof args === 'object' ? args?.project : null;
     const status = typeof args === 'object' ? args?.status : null;
     const issueType = typeof args === 'object' ? args?.issueType : null;
-    const maxResults = (typeof args === 'object' ? args?.maxResults : null) || 100;
+    const maxResults = (typeof args === 'object' ? args?.maxResults : null) || 50;
 
     if (!query) return { error: 'Missing query parameter' };
 
