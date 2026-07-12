@@ -227,18 +227,22 @@ export class ApiClient {
       }
     }
 
-    // 2) Reliable path: paginate ids via the enhanced GET endpoint.
-    // Exact count (no estimation). HARD_CAP is only a safety ceiling so a
-    // pathological instance can't hang the UI — it is well above realistic
-    // ticket volumes, so a normal count is never truncated.
+    // 2) Reliable path: paginate ids via the GET endpoint.
+    // Try nextPageToken first (enhanced search), fall back to startAt (classic).
     const PAGE = 100;
     const HARD_CAP = 60000;
     const MAX_PAGES = 600;
     let count = 0;
     let nextPageToken = null;
+    let startAt = 0;
+    let useStartAt = false; // switch to startAt pagination if nextPageToken not supported
     for (let i = 0; i < MAX_PAGES; i++) {
       let url = `${this.jiraApiBase}/rest/api/3/search/jql?jql=${encodeURIComponent(jql)}&maxResults=${PAGE}&fields=id`;
-      if (nextPageToken) url += `&nextPageToken=${encodeURIComponent(nextPageToken)}`;
+      if (useStartAt) {
+        url += `&startAt=${startAt}`;
+      } else if (nextPageToken) {
+        url += `&nextPageToken=${encodeURIComponent(nextPageToken)}`;
+      }
       const res = await fetchWithTimeout(url, { headers: this.jiraHeaders });
       if (!res.ok) {
         const text = await res.text().catch(() => '');
@@ -248,8 +252,20 @@ export class ApiClient {
       const issues = data.issues || data.values || [];
       count += issues.length;
       if (count >= HARD_CAP) return { count, capped: true, approximate: false };
-      if (data.isLast || !data.nextPageToken || issues.length === 0) break;
-      nextPageToken = data.nextPageToken;
+
+      // Check if there are more pages
+      if (data.isLast || issues.length === 0) break;
+
+      // Try nextPageToken (enhanced search endpoint)
+      if (data.nextPageToken) {
+        nextPageToken = data.nextPageToken;
+      } else {
+        // Fall back to startAt pagination (classic endpoint)
+        useStartAt = true;
+        startAt += issues.length;
+        // If this page was smaller than PAGE, we're done
+        if (issues.length < PAGE) break;
+      }
     }
     return { count, capped: false, approximate: false };
   }
