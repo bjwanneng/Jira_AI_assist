@@ -1,6 +1,8 @@
 import { LLM_TIMEOUT_MS } from '../shared/constants.js';
 import { hasHostPermission } from '../shared/permissions.js';
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 /**
  * Coerce an embedding payload into a number[].
  * Handles both float arrays and base64-encoded float32 strings (some
@@ -109,20 +111,50 @@ export class LlmClient {
       if (this.embedDims && this.embedDims > 0) {
         body.dimensions = this.embedDims;
       }
-      const res = await fetch(this.embeddingsUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${this.embedApiKey}`
-        },
-        body: JSON.stringify(body),
-        signal: controller.signal
-      });
-      clearTimeout(timeoutId);
-      if (!res.ok) {
+      // Retry on 429 (TPM/RPM rate limit) with exponential backoff. Provider
+      // tells us when to slow down; respecting Retry-After when present.
+      const MAX_RETRIES = 4;
+      let res = null;
+      let lastErr = null;
+      for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+        try {
+          res = await fetch(this.embeddingsUrl, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${this.embedApiKey}`
+            },
+            body: JSON.stringify(body),
+            signal: controller.signal
+          });
+        } catch (netErr) {
+          lastErr = netErr;
+          if (attempt < MAX_RETRIES) {
+            await sleep(500 * Math.pow(2, attempt));
+            continue;
+          }
+          throw netErr;
+        }
+        if (res.ok) break;
+        // 429 → retry with backoff. Other 4xx/5xx → fail fast.
+        if (res.status === 429 && attempt < MAX_RETRIES) {
+          const retryAfter = Number(res.headers.get('retry-after'));
+          const waitMs = Number.isFinite(retryAfter) && retryAfter > 0
+            ? retryAfter * 1000
+            : Math.min(30000, 1000 * Math.pow(2, attempt) + Math.random() * 500);
+          console.warn(`[embed] 429 rate limit, retrying in ${Math.round(waitMs)}ms (attempt ${attempt + 1}/${MAX_RETRIES})`);
+          // Drain the body so the connection can be reused.
+          await res.text().catch(() => {});
+          await sleep(waitMs);
+          continue;
+        }
         const text = await res.text().catch(() => '');
         throw new Error(`Embedding API error ${res.status}: ${text.slice(0, 300)}`);
       }
+      if (!res || !res.ok) {
+        throw lastErr || new Error('Embedding API exhausted retries');
+      }
+      clearTimeout(timeoutId);
       const data = await res.json();
 
       // Normalize to number[][] across the response shapes providers use:
@@ -161,22 +193,36 @@ export class LlmClient {
       }
 
       // Providers may return more vectors than requested (trim those).
-      // If they return FEWER, retry one-by-one (some providers like Ark
-      // multimodal only support single-input despite accepting arrays).
+      // If they return FEWER, retry one-by-one IN PARALLEL (some providers
+      // like Ark multimodal only support single-input despite accepting
+      // arrays). Per-issue requests fire with bounded concurrency to avoid
+      // rate limits.
       if (vectors.length < input.length && input.length > 1) {
-        console.warn(`[embed] Provider returned ${vectors.length}/${input.length} vectors, falling back to sequential embed`);
-        const seqVectors = [];
-        for (const singleInput of input) {
-          const seqRes = await fetch(this.embeddingsUrl, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${this.embedApiKey}` },
-            body: JSON.stringify({ model: this.embedModel, input: [singleInput], encoding_format: 'float' })
+        console.warn(`[embed] Provider returned ${vectors.length}/${input.length} vectors, falling back to per-issue embed (parallel)`);
+        const CONCURRENCY = 5;
+        const seqVectors = new Array(input.length).fill(null);
+        for (let i = 0; i < input.length; i += CONCURRENCY) {
+          const slice = input.slice(i, i + CONCURRENCY);
+          const results = await Promise.allSettled(
+            slice.map((singleInput) =>
+              fetch(this.embeddingsUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${this.embedApiKey}` },
+                body: JSON.stringify({ model: this.embedModel, input: [singleInput], encoding_format: 'float' })
+              }).then(async (seqRes) => {
+                if (!seqRes.ok) return null;
+                const seqData = await seqRes.json();
+                const seqArr = Array.isArray(seqData?.data)
+                  ? seqData.data
+                  : (seqData?.data?.embedding ? [{ embedding: seqData.data.embedding }] : []);
+                const seqVec = seqArr.map((d) => toVector(d?.embedding)).filter(Array.isArray);
+                return seqVec[0] || null;
+              })
+            )
+          );
+          results.forEach((r, j) => {
+            if (r.status === 'fulfilled') seqVectors[i + j] = r.value;
           });
-          if (!seqRes.ok) { seqVectors.push(null); continue; }
-          const seqData = await seqRes.json();
-          let seqArr = Array.isArray(seqData?.data) ? seqData.data : (seqData?.data?.embedding ? [{ embedding: seqData.data.embedding }] : []);
-          const seqVec = seqArr.map((d) => toVector(d?.embedding)).filter(Array.isArray);
-          seqVectors.push(seqVec[0] || null);
         }
         const valid = seqVectors.filter(Array.isArray);
         if (valid.length > 0) return seqVectors;
@@ -251,7 +297,9 @@ export class LlmClient {
       }
 
       const data = await res.json();
-      return data.choices?.[0]?.message || { role: 'assistant', content: '' };
+      const msg = data.choices?.[0]?.message || { role: 'assistant', content: '' };
+      msg.finish_reason = data.choices?.[0]?.finish_reason || null;
+      return msg;
     } catch (err) {
       clearTimeout(timeoutId);
       throw await this._wrapError(err);
@@ -332,6 +380,7 @@ export class LlmClient {
       let reasoningAcc = '';
       let contentAcc = '';
       let toolCallsAcc = [];
+      let finishReason = null;
 
       while (true) {
         const { done, value } = await reader.read();
@@ -351,7 +400,16 @@ export class LlmClient {
             if (payload === '[DONE]') continue;
             try {
               const json = JSON.parse(payload);
-              const delta = json.choices?.[0]?.delta;
+              const choice = json.choices?.[0];
+              const delta = choice?.delta;
+              // Capture finish_reason from the final chunk. Values:
+              //   stop    = model finished naturally
+              //   length  = hit max_tokens mid-generation (truncated!)
+              //   tool_calls = stopped to call a tool (normal)
+              //   content_filter = blocked by safety filter
+              if (choice?.finish_reason) {
+                finishReason = choice.finish_reason;
+              }
               if (!delta) continue;
               if (delta.reasoning_content) {
                 reasoningAcc += delta.reasoning_content;
@@ -378,7 +436,7 @@ export class LlmClient {
 
       clearTimeout(idleTimer);
       clearTimeout(totalTimer);
-      const msg = { role: 'assistant', content: contentAcc };
+      const msg = { role: 'assistant', content: contentAcc, finish_reason: finishReason };
       if (reasoningAcc) msg.reasoning_content = reasoningAcc;
       if (toolCallsAcc.length) msg.tool_calls = toolCallsAcc;
       return msg;

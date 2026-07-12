@@ -459,20 +459,38 @@ export class ToolExecutor {
 
       // Phase 1: paginated fetch. Jira Cloud's GET search API caps at 100
       // per page regardless of maxResults param, so we loop to get all.
-      const MAX_POOL = 500;
+      const MAX_POOL = 1000;
       const t0 = Date.now();
       const pool = [];
+      const seenKeys = new Set(); // dedup — nextPageToken/startAt flapping can repeat rows
       let startAt = 0;
+      let pageToken = null;
+      let useStartAtFallback = false;
       let total = 0;
       while (pool.length < MAX_POOL) {
         const PAGE_SIZE = 100;
-        const res = await this.api.searchJira(phase1Jql, PAGE_SIZE, startAt);
+        const pageOpts = useStartAtFallback
+          ? { startAt }
+          : { pageToken };
+        const res = await this.api.searchJira(phase1Jql, PAGE_SIZE, pageOpts);
         total = res.total || total;
         const issues = res.issues || [];
         if (issues.length === 0) break;
-        pool.push(...issues);
-        if (issues.length < PAGE_SIZE || pool.length >= total) break;
-        startAt += issues.length;
+        for (const it of issues) {
+          if (!seenKeys.has(it.key)) {
+            seenKeys.add(it.key);
+            pool.push(it);
+          }
+        }
+        if (res.nextPageToken) {
+          pageToken = res.nextPageToken;
+        } else {
+          useStartAtFallback = true;
+          startAt += issues.length;
+        }
+        if (res.isLast) break;
+        if (!res.nextPageToken && issues.length < PAGE_SIZE) break;
+        if (pool.length >= total) break;
       }
       console.log('[search_jira] Phase 1: %d/%d tickets fetched in %dms', pool.length, total, Date.now() - t0);
 
@@ -484,17 +502,68 @@ export class ToolExecutor {
         };
       }
 
-      // Phase 2a: if vector index exists, filter pool by vector similarity
+      // Phase 1.5: Keyword fallback channel — fire a JQL `text ~` query with
+      // the top expansion terms + org filter. This catches tickets whose
+      // summary/description/comments contain PD-adjacent keywords even when
+      // the local vector index missed them (incomplete coverage) or when
+      // MAX_POOL truncated the org. Jira's own BM25 ranks these, and any
+      // pool ticket that appears in the keyword hits gets a pre-rank boost.
+      let keywordHits = 0;
+      const keywordHitKeys = new Set();
+      try {
+        const kwTerms = (expansion.subQueries || [])
+          .flatMap((sq) => [...(sq.primaryTerms || []), ...(sq.synonyms || [])])
+          .filter((t) => t && t.length >= 3)
+          .slice(0, 8);
+        if (kwTerms.length > 0) {
+          const textOr = kwTerms.map((t) => buildJqlTextClause(t)).join(' OR ');
+          const kwJql = `(${textOr}) AND "${orgFieldId}" in (${mandatoryTerms.map((t) => `"${t.replace(/"/g, '')}"`).join(',')})` +
+            (project ? ` AND project = ${project.toUpperCase().replace(/[^A-Z0-9_]/gi, '')}` : '') +
+            ` ORDER BY updated DESC`;
+          // Pull full fields (incl description/comment) so these tickets have
+          // the same context as Phase-1 pool tickets when handed to the reranker.
+          const kwRes = await this.api.searchJira(kwJql, 100, {
+            fields: ['summary', 'description', 'comment', 'status', 'issuetype', 'priority', 'created', 'updated', 'labels', 'components']
+          });
+          let newCount = 0;
+          for (const it of (kwRes.issues || [])) {
+            if (!seenKeys.has(it.key)) {
+              seenKeys.add(it.key);
+              pool.push(it);
+              newCount++;
+            }
+            keywordHitKeys.add(it.key);
+            keywordHits++;
+          }
+          console.log('[search_jira] Phase 1.5 keyword fallback: %d hits (%d new), pool now %d',
+            keywordHits, newCount, pool.length);
+        }
+      } catch (kwErr) {
+        console.warn('[search_jira] keyword fallback failed (non-fatal):', kwErr.message);
+      }
+
+      // Phase 2a: if vector index exists, score pool by vector similarity.
+      // Used both to surface top candidates AND to pre-filter the pool so we
+      // don't send 500 tickets to the LLM reranker.
       let candidates = pool;
       let vectorHits = 0;
 
       if (vectorEnabled && vectorCount > 0) {
         const t1 = Date.now();
+        // Build embedding-friendly text per sub-query: lead with focus (the
+        // semantic anchor), then primaryTerms, then top 3 synonyms. Avoids
+        // dumping 14+ keywords into one bag-of-words — the embedding model
+        // handles anchored natural phrases better than keyword salad.
         const vecQueries = [
           query,
           ...expansion.subQueries.map((sq) => {
-            const terms = [...(sq.primaryTerms || []), ...(sq.synonyms || [])];
-            return terms.length > 0 ? terms.join(' ') : query;
+            const focus = sq.focus || '';
+            const primary = (sq.primaryTerms || []).slice(0, 5);
+            const syn = (sq.synonyms || []).slice(0, 3);
+            const phrase = [focus, ...primary, ...syn]
+              .filter((s) => s && s.length >= 2)
+              .join(' ');
+            return phrase || query;
           })
         ];
         try {
@@ -504,6 +573,8 @@ export class ToolExecutor {
 
           for (const vec of vecs) {
             if (!Array.isArray(vec) || vec.length === 0) continue;
+            // Two-phase: query a 3x wider vector topK because we filter a
+            // 500-ticket pool (vs keyword mode where JQL already narrows).
             const hits = await vectorSearch(vec, { topK: VECTOR_TOP_K * 3, queryModel: this.llm.embedModel });
             for (const h of hits) {
               // Only keep hits that are in the Phase 1 pool
@@ -522,32 +593,101 @@ export class ToolExecutor {
             vecScoreByKey.set(key, h.score);
           }
           vectorHits = vecScoreByKey.size;
-          console.log('[search_jira] Phase 2a: %d pool tickets have vector match in %dms', vectorHits, Date.now() - t1);
+          console.log('[search_jira] Phase 2a: %d/%d pool tickets have vector match in %dms', vectorHits, pool.length, Date.now() - t1);
 
-          // Attach vector scores to pool items for reranker context
+          // Attach vector scores to pool items
           candidates = pool.map(it => ({
             ...it,
             _vecScore: vecScoreByKey.get(it.key) || 0
           }));
         } catch (vecErr) {
           console.warn('[search_jira] vector search failed, using full pool:', vecErr.message);
-          candidates = pool;
+          candidates = pool.map(it => ({ ...it, _vecScore: 0 }));
         }
       }
 
-      // Phase 2: LLM batch rerank — ALL candidates are sent to the LLM in
-      // batches of 20 (parallel). The LLM reads each ticket's summary and
-      // judges relevance to the query. No keyword pre-filtering needed:
-      // the LLM IS the semantic engine — it understands that "violation path"
-      // relates to "timing" without requiring exact keyword matches.
+      // Pre-rank: when pool is large, trim to MAX_RERANK_CANDIDATES using a
+      // HYBRID score (normalized vector similarity + keyword overlap). Pure
+      // vecScore ranking drops pool tickets whose vectors aren't in the local
+      // index (vecScore=0), even when they're highly relevant — common when
+      // index coverage is partial. The keyword overlap term rescues them.
+      if (candidates.length > MAX_RERANK_CANDIDATES) {
+        const tPre = Date.now();
+        // Build a token set from the query + expansion terms for overlap score.
+        const termSet = new Set();
+        const addTokens = (s) => {
+          if (!s) return;
+          String(s).toLowerCase().split(/[^a-z0-9_]+/).forEach((t) => {
+            if (t.length >= 3) termSet.add(t);
+          });
+        };
+        addTokens(query);
+        for (const sq of (expansion.subQueries || [])) {
+          (sq.primaryTerms || []).forEach(addTokens);
+          (sq.synonyms || []).forEach(addTokens);
+        }
+        // Stash for later debugging
+        const termCount = termSet.size;
+
+        // Score each candidate. Three signals combined:
+        //   1. Local keyword overlap (summary + description + comments)
+        //   2. Vector similarity cosine (0..1) — 0 if not in local index
+        //   3. Jira BM25 boost: +0.3 if this ticket appeared in Phase 1.5
+        //      keyword search (Jira's own text relevance ranked it)
+        for (const c of candidates) {
+          const summary = (c.fields?.summary || '').toLowerCase();
+          const descRaw = c.fields?.description;
+          const desc = typeof descRaw === 'string'
+            ? descRaw.toLowerCase()
+            : (descRaw && typeof descRaw === 'object' ? JSON.stringify(descRaw).toLowerCase() : '');
+          // Pull comment text out of the Jira comment structure
+          let comments = '';
+          const cmts = c.fields?.comment?.comments;
+          if (Array.isArray(cmts)) {
+            for (const cm of cmts.slice(-5)) {
+              const body = typeof cm?.body === 'string'
+                ? cm.body
+                : (cm?.body && typeof cm.body === 'object' ? JSON.stringify(cm.body) : '');
+              comments += ' ' + body.toLowerCase();
+            }
+          }
+          const text = `${summary} ${desc} ${comments}`;
+          const tokens = new Set(text.split(/[^a-z0-9_]+/));
+          let overlap = 0;
+          for (const t of termSet) if (tokens.has(t)) overlap++;
+          const overlapScore = termCount > 0 ? overlap / termCount : 0;
+          const vecNorm = Math.max(0, (c._vecScore || 0));
+          const bm25Boost = keywordHitKeys.has(c.key) ? 0.3 : 0;
+          // Overlap (0..1) is primary; vec (0..1) × 0.5 secondary; BM25 boost
+          // additive. Total range 0..1.8.
+          c._hybridScore = (overlapScore * 1.0) + (vecNorm * 0.5) + bm25Boost;
+          c._overlapScore = overlapScore;
+        }
+        candidates.sort((a, b) =>
+          (b._hybridScore || 0) - (a._hybridScore || 0) ||
+          (b._vecScore || 0) - (a._vecScore || 0)
+        );
+        const droppedVecHits = candidates.slice(MAX_RERANK_CANDIDATES)
+          .filter((c) => (c._vecScore || 0) > 0).length;
+        candidates = candidates.slice(0, MAX_RERANK_CANDIDATES);
+        console.log('[search_jira] hybrid pre-rank: %d → %d in %dms (terms=%d, dropped %d vecHits)',
+          pool.length, candidates.length, Date.now() - tPre, termCount, droppedVecHits);
+      }
+
+      // Phase 2: LLM batch rerank — candidates are sent to the LLM in batches
+      // of 10 (parallel). The LLM reads each ticket's summary + description +
+      // top comment and judges relevance to the query. No keyword pre-filtering
+      // needed: the LLM IS the semantic engine — it understands that "violation
+      // path" relates to "timing" without requiring exact keyword matches.
       const t2 = Date.now();
-      const simplifiedPool = simplifySearchResults({ issues: candidates });
       const ranked = await rerankCandidates(
         { query, expansion },
-        candidates.map((it, idx) => ({
+        candidates.map((it) => ({
           key: it.key,
           fields: {
-            summary: it.fields?.summary || simplifiedPool[idx]?.summary || '',
+            summary: it.fields?.summary || '',
+            description: it.fields?.description || '',
+            comment: it.fields?.comment || null,
             status: it.fields?.status,
             issuetype: it.fields?.issuetype,
             priority: it.fields?.priority,
@@ -556,7 +696,7 @@ export class ToolExecutor {
           _vecScore: it._vecScore || 0
         })),
         this.llm,
-        { topN: Math.min(maxResults, candidates.length) }
+        { topN: Math.min(maxResults, MAX_RERANKED_RESULTS, candidates.length) }
       );
       console.log('[search_jira] Phase 2: LLM reranked %d -> %d in %dms', candidates.length, ranked.length, Date.now() - t2);
 
@@ -587,6 +727,7 @@ export class ToolExecutor {
         orgFieldId,
         poolSize: pool.length,
         vectorHits,
+        keywordHits,
         vectorEnabled,
         vectorIndexCount: vectorCount,
         subQueryCount: expansion.subQueries.length,
@@ -655,9 +796,15 @@ export class ToolExecutor {
 
     const shouldRunVector = vectorEnabled && vectorCount > 0;
     if (shouldRunVector) {
+      // Anchored natural phrase per sub-query (see two-phase comment above).
       const vecQueries = [query, ...subQueries.map((sq) => {
-        const terms = [...(sq.primaryTerms || []), ...(sq.synonyms || [])];
-        return terms.length > 0 ? terms.join(' ') : query;
+        const focus = sq.focus || '';
+        const primary = (sq.primaryTerms || []).slice(0, 5);
+        const syn = (sq.synonyms || []).slice(0, 3);
+        const phrase = [focus, ...primary, ...syn]
+          .filter((s) => s && s.length >= 2)
+          .join(' ');
+        return phrase || query;
       })];
       allTasks.push((async () => {
         const vecs = await this.llm.embed(vecQueries);
@@ -721,11 +868,11 @@ export class ToolExecutor {
       _tier: tierByKey.get(entry.item.key) ?? 99
     })).slice(0, MAX_RERANK_CANDIDATES);
 
-    console.log('[search_jira] RRF: %d candidates, reranking top %d...', candidates.length, Math.min(maxResults, candidates.length));
+    console.log('[search_jira] RRF: %d candidates, reranking top %d...', candidates.length, Math.min(maxResults, MAX_RERANKED_RESULTS, candidates.length));
 
     const ranked = await rerankCandidates(
       { query, expansion }, candidates, this.llm,
-      { topN: Math.min(maxResults, candidates.length) }
+      { topN: Math.min(maxResults, MAX_RERANKED_RESULTS, candidates.length) }
     );
 
     const fieldByKey = new Map(candidates.map((it) => [it.key, it]));

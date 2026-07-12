@@ -47,6 +47,20 @@ Domain abbreviations:
   MMIO = Memory-Mapped I/O
   SoC = System on Chip
 
+CRITICAL — PD adjacency rule:
+When the query mentions "PD" / "physical design" / "implementation" / "backend"
+(or a customer name + a process node like "P870" / "N12" / "5nm"), the user
+almost always wants tickets from ALL of these sub-domains (produce 6 sub-queries):
+  1. Core PD: physical design, floorplan, placement, P&R, routing, timing closure, critical path
+  2. Timing/SDC: violation path, slack, WNS/TNS, SDC, constraint, false path, set_max_delay, retiming
+  3. Power/UPF: UPF, level shifter, isolation, power domain, VCLP, IR drop
+  4. DFT/MBIST: MBIST, lvlib, tcd, ATPG, scan, Formality, DRC, empty module, ICG, hier cell
+  5. TRNG/special IP: TRNG, ring oscillator, entropy, preserve, oscillator
+  6. Delivery/docs: PD guide, signoff guide, missing file, not in release, delivery, contradiction
+Tickets titled "Implementation issue" / "violation path" / "empty module" / "ask for X file"
+ARE PD-related even though they lack the literal string "physical design" — your
+sub-queries MUST surface them via synonym/paraphrase terms, not just the canonical jargon.
+
 The query may mention a customer or organization name (any company/entity name, e.g. an abbreviation used as a customer identifier). If present, extract it into mandatoryTerms — it will be used to filter by the Jira "Organizations" field. Do NOT hardcode specific customer names; detect them generically from the query text.
 
 Return ONLY a JSON object (no prose, no markdown fence):

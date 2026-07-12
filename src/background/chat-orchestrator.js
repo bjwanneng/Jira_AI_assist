@@ -15,40 +15,74 @@ const PATHOLOGICAL_SAFETY_NET = 100;
 
 /**
  * Cap the size of a tool result before feeding it back into the model context.
- * For search results, prioritizes the issues list over JQL/channels metadata
- * so the LLM always sees the actual ticket data even when truncated.
+ *
+ * Information-preservation policy: NEVER drop an entire issue just to fit a
+ * char budget — that loses recall silently. Instead, progressively compact:
+ *   1. Full JSON (drop only verbose JQL/channel metadata)
+ *   2. Per-issue field trim (keep key/summary/score/reason; drop status/priority/updated)
+ *   3. Compact line format (~120 chars/issue vs ~300 in JSON) — preserves ALL issues
+ *   4. Per-issue summary truncation (cap each summary at 120 chars; issues list intact)
+ *
+ * Only the final brute slice on non-issue payloads is allowed.
  */
-function compactToolResult(result, maxChars = 8000) {
-  // For search_jira results, strip JQL/channels to save space for issues
+function compactToolResult(result, maxChars = 24000) {
   if (result && typeof result === 'object' && Array.isArray(result.issues)) {
     const compact = { ...result };
-    // Replace verbose JQL string with a short note
     if (compact.jql) compact.jql = `(JQL omitted - ${compact.subQueryCount || '?'} sub-queries)`;
-    // Remove channel details entirely (they're just JQL strings)
     delete compact.channels;
     delete compact.subQueryFocuses;
+
+    // Tier 1: full JSON, only metadata stripped
     let str;
     try { str = JSON.stringify(compact, null, 2); } catch { str = String(compact); }
     if (str.length <= maxChars) return str;
-    // Still too long: keep only the issues array + query + total
-    const issuesOnly = JSON.stringify({
+
+    // Tier 2: trim verbose per-issue fields, keep all issues
+    const issuesSlim = compact.issues.map((it) => ({
+      key: it.key,
+      summary: it.summary,
+      score: it.score,
+      reason: it.reason
+    }));
+    const tier2 = JSON.stringify({
       query: compact.query,
       total: compact.total,
-      issues: compact.issues,
+      issues: issuesSlim,
       subQueryCount: compact.subQueryCount,
       vectorEnabled: compact.vectorEnabled,
-      vectorRecall: compact.vectorRecall
+      vectorRecall: compact.vectorRecall,
+      searchMode: compact.searchMode
     }, null, 2);
-    if (issuesOnly.length <= maxChars) return issuesOnly;
-    // Last resort: truncate the issues array itself
-    const maxIssues = Math.max(5, Math.floor(maxChars / 300)); // ~300 chars per issue
-    const truncated = {
-      query: compact.query,
-      total: compact.total,
-      issues: compact.issues.slice(0, maxIssues),
-      note: `Showing top ${maxIssues} of ${compact.issues.length} issues`
-    };
-    return JSON.stringify(truncated, null, 2);
+    if (tier2.length <= maxChars) return tier2;
+
+    // Tier 3: compact line format — preserve every issue, ~120 chars each
+    const lines = [
+      `Query: ${compact.query || '?'}`,
+      `Total: ${compact.total ?? compact.issues.length} | Mode: ${compact.searchMode || '?'} | Vector hits: ${compact.vectorRecall ?? '?'}`,
+      ''
+    ];
+    for (let i = 0; i < compact.issues.length; i++) {
+      const it = compact.issues[i];
+      const score = (typeof it.score === 'number') ? ` (s=${it.score})` : '';
+      const reason = it.reason ? ` — ${it.reason}` : '';
+      const summary = String(it.summary || '(no summary)').slice(0, 140);
+      // ~120-200 chars per line; for 50 issues this fits easily in 24k
+      lines.push(`${i + 1}. [${it.key}]${score} ${summary}${reason}`.slice(0, 240));
+    }
+    const tier3 = lines.join('\n');
+    if (tier3.length <= maxChars) return tier3;
+
+    // Tier 4: hard cap each line so the FULL list still fits. This is the
+    // last resort — we keep all issues, just trim verbose summaries/reasons.
+    const perLine = Math.max(80, Math.floor((maxChars - lines[0].length - lines[1].length - 20) / compact.issues.length));
+    const trimmedLines = lines.slice(0, 2);
+    for (let i = 0; i < compact.issues.length; i++) {
+      const it = compact.issues[i];
+      const score = (typeof it.score === 'number') ? ` (s=${it.score})` : '';
+      const summary = String(it.summary || '').slice(0, Math.max(40, perLine - it.key.length - score.length - 16));
+      trimmedLines.push(`${i + 1}. [${it.key}]${score} ${summary}`);
+    }
+    return trimmedLines.join('\n');
   }
 
   let str;
@@ -174,6 +208,17 @@ export class ChatOrchestrator {
     const toolCalls = [];
     const collectedSources = [];
     let rounds = 0;
+    // Auto-continue accumulator: when finish_reason='length' (max_tokens hit
+    // mid-answer) the model's response is truncated. We push the partial to
+    // history, ask for continuation, and concatenate the next response. Cap
+    // prevents unbounded growth if the model genuinely can't fit in N rounds.
+    const MAX_AUTO_CONTINUES = 4;
+    let continueCount = 0;
+    let pendingPartial = '';
+    // Mark the position in conversationHistory where the auto-continue
+    // sequence (partial + "continue" prompts) started, so we can collapse
+    // those entries into one clean assistant message on finalization.
+    let continueStartIdx = -1;
 
     // Tool loop: LLM may call tools, we execute and feed back, repeat until
     // the model returns a final answer with no tool calls.
@@ -213,6 +258,59 @@ export class ChatOrchestrator {
       // tag convention. Try the native field first, fall back to the tag.
       const reasoning = response.reasoning_content || parseReasoning(content);
 
+      // ============================================================
+      // AUTO-CONTINUE on max_tokens truncation
+      // ============================================================
+      // finish_reason='length' means the model hit max_tokens mid-generation.
+      // If we don't act, the user sees a half-answer and has to type "please
+      // continue" manually. Detect this and auto-prompt continuation.
+      //
+      // We only auto-continue when:
+      //   - finish_reason === 'length' (not 'stop', not 'tool_calls')
+      //   - no tool call JSON in the content (tool truncation has its own path)
+      //   - under the MAX_AUTO_CONTINUES cap
+      //
+      // The partial content is pushed to history + a "continue" user message,
+      // and the next iteration's response is concatenated onto pendingPartial
+      // to form the full answer.
+      const preliminaryContent = pendingPartial + content;
+      const truncated = response.finish_reason === 'length';
+      if (truncated && continueCount < MAX_AUTO_CONTINUES && !parseToolCalls(preliminaryContent)) {
+        continueCount++;
+        console.warn('[orchestrator] response truncated (finish_reason=length), auto-continuing (%d/%d)',
+          continueCount, MAX_AUTO_CONTINUES);
+        // Mark this position so we can collapse the partial+continue sequence
+        // into one clean assistant turn on finalization.
+        if (continueStartIdx < 0) continueStartIdx = this.conversationHistory.length;
+        // Save partial so the next iteration's content merges onto it.
+        pendingPartial = preliminaryContent;
+        // Push the partial as the assistant turn (so the model sees what it
+        // already wrote), then ask for the rest.
+        this.conversationHistory.push({ role: 'assistant', content });
+        this.conversationHistory.push({
+          role: 'user',
+          content: 'Please continue from where you left off. Do not repeat what you already wrote, just keep going and finish the response.'
+        });
+        rounds++;
+        await this.persist();
+        continue;
+      }
+
+      // If we get here with a non-truncated response after a previous continue,
+      // finalize the merged content. Also collapse the partial+continue
+      // entries in history so future turns see one clean assistant message.
+      const mergedContent = pendingPartial + content;
+      if (continueStartIdx >= 0 && continueStartIdx < this.conversationHistory.length) {
+        // Remove the [partial, continue, partial, continue, ...] sequence and
+        // let the downstream code push the final merged answer.
+        this.conversationHistory.splice(continueStartIdx);
+        continueStartIdx = -1;
+      }
+      pendingPartial = '';
+
+      // Use mergedContent for all downstream parsing/display.
+      const effectiveContent = mergedContent;
+
       // Surface every round's thinking to the UI — don't dedup. In a multi-
       // round tool loop the user wants to see "plan search" → "review results"
       // → "synthesize answer" as separate cards, not just the first one.
@@ -227,15 +325,15 @@ export class ChatOrchestrator {
         });
       }
 
-      const requestedTools = parseToolCalls(content);
+      const requestedTools = parseToolCalls(effectiveContent);
       if (!requestedTools) {
         // Check if this looks like a TRUNCATED tool call attempt (model meant
         // to call a tool but the JSON got cut off by max_tokens).
-        if (looksLikeTruncatedToolCall(content) && rounds < PATHOLOGICAL_SAFETY_NET - 2) {
+        if (looksLikeTruncatedToolCall(effectiveContent) && rounds < PATHOLOGICAL_SAFETY_NET - 2) {
           console.warn('[orchestrator] detected truncated tool call, asking model to retry one-at-a-time');
           // Push the truncated attempt so the model sees its own context, then
           // ask it to retry with a SINGLE tool call.
-          this.conversationHistory.push({ role: 'assistant', content });
+          this.conversationHistory.push({ role: 'assistant', content: effectiveContent });
           this.conversationHistory.push({
             role: 'user',
             content: 'Your previous tool call JSON was truncated (likely by max_tokens). Please make ONE tool call at a time now, with a minimal JSON. Do not batch multiple tool calls in a single response.'
@@ -245,7 +343,7 @@ export class ChatOrchestrator {
         }
 
         // No tool calls - this is the final answer. Strip reasoning + JSON meta.
-        let cleanAnswer = stripMeta(content) || content;
+        let cleanAnswer = stripMeta(effectiveContent) || effectiveContent;
         // If the "answer" is just JSON garbage, surface a clear message instead
         if (!cleanAnswer || looksLikeTruncatedToolCall(cleanAnswer)) {
           const fallback = 'I ran into trouble producing a clean response. Please try rephrasing your question, or ask me to summarize what I have so far.';
@@ -258,11 +356,11 @@ export class ChatOrchestrator {
         // avoid duplicating the source list in the same bubble.
         this.conversationHistory.push({ role: 'assistant', content: cleanAnswer });
         await this.persist();
-        return { content: cleanAnswer, toolCalls, reasoning, sources: collectedSources };
+        return { content: cleanAnswer, toolCalls, reasoning, sources: collectedSources, autoContinued: continueCount > 0 ? continueCount : undefined };
       }
 
       // Execute each requested tool
-      this.conversationHistory.push({ role: 'assistant', content });
+      this.conversationHistory.push({ role: 'assistant', content: effectiveContent });
 
       for (const call of requestedTools) {
         const toolEntry = { name: call.name, args: call.arguments || {} };

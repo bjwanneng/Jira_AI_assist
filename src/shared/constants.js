@@ -69,8 +69,8 @@ export const MAX_COMMENTS = 20;
 export const LLM_TIMEOUT_MS = 60000;
 
 // Hybrid search + rerank pipeline tuning.
-export const MAX_RERANK_CANDIDATES = 80;
-export const MAX_RERANKED_RESULTS = 30;
+export const MAX_RERANK_CANDIDATES = 200;
+export const MAX_RERANKED_RESULTS = 100;
 export const RRF_K = 60;
 
 // Cross-ticket pattern analysis (cluster-analyzer) tuning.
@@ -84,14 +84,14 @@ export const CLUSTER_MAX_COMMENTS = 3;
 // Bump when summarizer/expander prompt schema changes — invalidates cached
 // records with stale schemaVersion.
 export const SUMMARY_SCHEMA_VERSION = 1;
-export const QUERY_EXPANSION_SCHEMA_VERSION = 1;
+export const QUERY_EXPANSION_SCHEMA_VERSION = 2;
 export const EMBEDDING_SCHEMA_VERSION = 1;
 
 export const ISSUE_KEY_REGEX = /([A-Z][A-Z0-9_]+-\d+)/g;
 
 // Dense-vector similarity index (ticket-indexer) tuning.
 export const MAX_INDEX_ISSUES = 2000; // fallback cap if config is missing
-export const INDEX_MAX_ISSUES_HARD_CAP = 5000; // absolute ceiling on indexMaxIssues
+export const INDEX_MAX_ISSUES_HARD_CAP = 20000; // absolute ceiling on indexMaxIssues
 export const INDEX_PAGE_SIZE = 100; // JQL page size when bulk-loading
 // Jira Cloud forbids *unbounded* JQL (pure `ORDER BY` with no restriction).
 // The full-build query must carry a search restriction, so we bound it by a

@@ -1,17 +1,17 @@
 /**
  * LLM-as-reranker for the hybrid-search pipeline.
  *
- * Mirrors Rovo's rerank step: after RRF produces a top-20 candidate pool, a
+ * Mirrors Rovo's rerank step: after RRF produces a top-N candidate pool, a
  * single LLM call scores each candidate against the source ticket / query and
  * returns top-N with one-line reasons. The rerank call is the highest-leverage
  * step — it's where "retrieved" becomes "relevant".
  *
  * Input shape (candidates):
- *   [{ key, summary, status, priority, _tier, _rrfScore }]
+ *   [{ key, fields: { summary, description, comments, status, priority }, _tier, _rrfScore }]
  *
  * Output shape:
  *   [{ key, score (0-100), reason (string), _rrfScore (carried through) }]
- *   sorted by score desc, capped at topN (default 5).
+ *   sorted by score desc, capped at topN (default 30).
  *
  * Fallback: if the LLM call fails, returns the top-N candidates by RRF score
  * with empty reasons — search still works, just without the "why this matches"
@@ -20,9 +20,18 @@
 
 import { MAX_RERANK_CANDIDATES, MAX_RERANKED_RESULTS } from '../shared/constants.js';
 import { parseLlmJson } from '../shared/llm-json.js';
+import { extractDescriptionText, extractCommentText } from '../shared/utils.js';
 
-const RERANKER_SYSTEM_PROMPT = `You rank Jira tickets by similarity to a source ticket.
-Compare error codes, reproduction paths, root cause categories, environments — be terse.
+const RERANKER_SYSTEM_PROMPT = `You rank Jira tickets by relevance to a source query/ticket.
+Score each candidate 0-100 based on:
+  - Title/summary match to the query domain (highest weight)
+  - Description body content (medium weight — many PD tickets describe the
+    issue in the body without using PD keywords in the title)
+  - Recent comments (lower weight — but a comment may reveal the true topic)
+Compare error codes, reproduction paths, root cause categories, environments.
+Be terse but DO read the description/comments before scoring — a ticket whose
+title looks unrelated may be highly relevant based on its body.
+
 Return ONLY a JSON array (no prose, no markdown fence):
 [
   { "key": "PROJ-123", "score": 87, "reason": "same NullPointerException in PaymentService" },
@@ -31,15 +40,51 @@ Return ONLY a JSON array (no prose, no markdown fence):
 Score 0-100. Sort the array by score descending. Every candidate must appear exactly once.
 Reason must be a single short line (<= 80 chars).`;
 
+/**
+ * Build a compact per-candidate context block. Each line includes summary +
+ * description excerpt + the most recent comment, so the LLM can spot tickets
+ * whose relevance lives in the body rather than the title.
+ *
+ * Budget per candidate ~ 320 chars (vs ~80 for summary-only). With BATCH_SIZE=10
+ * that's ~3.2k chars per batch — well within cheap-model context.
+ */
+function buildCandidateLine(c, idx) {
+  const f = c.fields || {};
+  const summary = (f.summary || c.summary || '(no summary)').slice(0, 140);
+  const tier = c._tier ?? '-';
+  const vecScore = typeof c._vecScore === 'number' && c._vecScore > 0
+    ? ` v=${c._vecScore.toFixed(2)}`
+    : '';
+
+  // Description excerpt: strip ADF, collapse whitespace, take first 200 chars
+  let descExcerpt = '';
+  if (f.description) {
+    const desc = extractDescriptionText(f.description)
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (desc) descExcerpt = desc.slice(0, 180);
+  }
+
+  // Most recent meaningful comment (skip if none)
+  let commentExcerpt = '';
+  const comments = f.comment?.comments;
+  if (Array.isArray(comments) && comments.length > 0) {
+    const last = comments[comments.length - 1];
+    const body = extractCommentText(last).replace(/\s+/g, ' ').trim();
+    if (body) commentExcerpt = body.slice(0, 120);
+  }
+
+  const parts = [
+    `${idx + 1}. [${c.key}]${vecScore} t${tier}`,
+    `S: ${summary}`
+  ];
+  if (descExcerpt) parts.push(`D: ${descExcerpt}`);
+  if (commentExcerpt) parts.push(`C: ${commentExcerpt}`);
+  return parts.join(' | ');
+}
+
 function buildRerankerUserPrompt(sourceBlock, candidates) {
-  const lines = candidates.map((c, i) => {
-    const f = c.fields || {};
-    const summary = f.summary || c.summary || '(no summary)';
-    const status = f.status?.name || c.status || '?';
-    const priority = f.priority?.name || c.priority || '?';
-    const tier = c._tier ?? '-';
-    return `${i + 1}. ${c.key} — ${summary} [status=${status}, priority=${priority}, tier=${tier}]`;
-  });
+  const lines = candidates.map((c, i) => buildCandidateLine(c, i));
   return `Source:
 ${sourceBlock}
 
@@ -132,9 +177,10 @@ export async function rerankCandidates(source, candidates, llm, opts = {}) {
   }
 
   // Process in batches to handle large candidate pools without truncation.
-  // Each batch is small enough for one LLM call (~20 candidates × 50 tokens).
-  // All batches run in parallel, results are merged at the end.
-  const BATCH_SIZE = 20;
+  // BATCH_SIZE=10 because each candidate now carries summary + description
+  // excerpt + comment (~320 chars) — 10 × 320 = 3.2k chars per batch, leaving
+  // ample headroom in the cheap model's context window.
+  const BATCH_SIZE = 10;
   const batches = [];
   for (let i = 0; i < allCandidates.length; i += BATCH_SIZE) {
     batches.push(allCandidates.slice(i, i + BATCH_SIZE));
@@ -171,5 +217,14 @@ export async function rerankCandidates(source, candidates, llm, opts = {}) {
   // Merge all batch results, sort by score desc then RRF score desc
   const scored = batchResults.flat();
   scored.sort((a, b) => b.score - a.score || (b._rrfScore || 0) - (a._rrfScore || 0));
-  return scored.slice(0, topN);
+
+  // Drop score=0 entries (failed-batch / LLM-omitted) ONLY when there are
+  // enough positive-score entries to fill topN. If most batches failed we
+  // keep the 0-score ones so the user still sees results ranked by RRF.
+  const positiveCount = scored.filter((s) => s.score > 0).length;
+  let pool = scored;
+  if (positiveCount >= topN) {
+    pool = scored.filter((s) => s.score > 0);
+  }
+  return pool.slice(0, topN);
 }

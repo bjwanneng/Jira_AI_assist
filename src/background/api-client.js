@@ -120,8 +120,40 @@ export class ApiClient {
     return res.json();
   }
 
-  async searchJira(jql, maxResults = MAX_RELATED_ISSUES, startAt = 0) {
-    const fields = ['summary', 'status', 'issuetype', 'priority', 'created', 'updated'];
+  /**
+   * Search Jira via the enhanced /rest/api/3/search/jql endpoint.
+   *
+   * Pagination: the enhanced-search endpoint uses `nextPageToken`-based
+   * pagination. `startAt` is silently ignored on most Cloud instances, which
+   * means callers that pass only `startAt` get page 1 on EVERY call (and
+   * dedup downstream → only 100 unique results). To page correctly:
+   *   - Pass { pageToken } on subsequent calls, using the `nextPageToken`
+   *     returned by the previous call.
+   *   - Loop until `nextPageToken` is null/undefined AND `isLast` is true
+   *     (or issues.length < maxResults).
+   *   - As a fallback (some older instances don't return tokens), `startAt`
+   *     is still sent and the caller can iterate it.
+   *
+   * @param {string} jql
+   * @param {number} [maxResults]
+   * @param {number|object} [startAtOrOpts] - number (legacy startAt) OR opts object
+   * @param {object} [legacyOpts] - opts object (when 3rd arg is number)
+   * @param {string} [legacyOpts.pageToken] - nextPageToken from previous call
+   * @param {string[]} [legacyOpts.fields] - field list; default is minimal,
+   *   pass JIRA_FIELDS for full issue body (description/comment/etc.)
+   * @returns {Promise<{issues: object[], total: number, nextPageToken: ?string, isLast: boolean, _endpoint: string}>}
+   */
+  async searchJira(jql, maxResults = MAX_RELATED_ISSUES, startAtOrOpts = 0, legacyOpts = {}) {
+    // Polymorphic 3rd arg: accept either { startAt: number } (legacy) or
+    // { pageToken, fields } (new). Keeps all existing callers working.
+    const opts = (typeof startAtOrOpts === 'object' && startAtOrOpts !== null)
+      ? startAtOrOpts
+      : { startAt: startAtOrOpts, ...(legacyOpts || {}) };
+    const startAt = typeof opts.startAt === 'number' ? opts.startAt : 0;
+    const pageToken = opts.pageToken || null;
+    const fields = Array.isArray(opts.fields) && opts.fields.length > 0
+      ? opts.fields
+      : ['summary', 'status', 'issuetype', 'priority', 'created', 'updated'];
     const fieldsStr = fields.join(',');
 
     // Jira Cloud search reality (verified against Atlassian's own community
@@ -132,26 +164,39 @@ export class ApiClient {
     // (/rest/api/3/search/jql?jql=...) works reliably everywhere. So we lead
     // with GET and only fall back to POST for very long JQL that would exceed
     // URL length limits. The legacy /rest/api/2/search paths are gone (410).
+    const qp = new URLSearchParams();
+    qp.set('jql', jql);
+    qp.set('maxResults', String(maxResults));
+    qp.set('fields', fieldsStr);
+    // Send BOTH startAt and nextPageToken. Atlassian docs say one or the
+    // other should be sent, but in practice:
+    //   - Enhanced search ignores startAt, uses nextPageToken when present.
+    //   - Classic/older instances ignore nextPageToken, use startAt.
+    // Sending both is harmless and covers both paths. Whichever the instance
+    // honors, the response will carry the appropriate continuation cue.
+    if (pageToken) qp.set('nextPageToken', pageToken);
+    else qp.set('startAt', String(startAt));
+
+    const adapt = (data) => ({
+      issues: (data.issues || data.values || []),
+      total: data.total ?? (data.issues || data.values || []).length,
+      nextPageToken: data.nextPageToken || null,
+      isLast: data.isLast === true,
+      _endpoint: ''
+    });
+
     const attempts = [
       {
         method: 'GET',
-        url: `${this.jiraApiBase}/rest/api/3/search/jql?jql=${encodeURIComponent(jql)}&startAt=${startAt}&maxResults=${maxResults}&fields=${encodeURIComponent(fieldsStr)}`,
+        url: `${this.jiraApiBase}/rest/api/3/search/jql?${qp.toString()}`,
         body: null,
-        adapt: (data) => ({
-          issues: (data.issues || data.values || []),
-          total: data.total ?? (data.issues || data.values || []).length,
-          _endpoint: 'GET /rest/api/3/search/jql'
-        })
+        adapt: (data) => ({ ...adapt(data), _endpoint: 'GET /rest/api/3/search/jql' })
       },
       {
         method: 'POST',
         url: `${this.jiraApiBase}/rest/api/3/search/jql`,
-        body: { jql, fields, maxResults, startAt },
-        adapt: (data) => ({
-          issues: (data.issues || data.values || []),
-          total: data.total ?? (data.issues || data.values || []).length,
-          _endpoint: 'POST /rest/api/3/search/jql'
-        })
+        body: { jql, fields, maxResults, ...(pageToken ? { nextPageToken: pageToken } : { startAt }) },
+        adapt: (data) => ({ ...adapt(data), _endpoint: 'POST /rest/api/3/search/jql' })
       }
     ];
 

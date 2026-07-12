@@ -29,9 +29,15 @@ import {
 import {
   MAX_INDEX_ISSUES, INDEX_MAX_ISSUES_HARD_CAP, INDEX_PAGE_SIZE, EMBED_TEXT_MAX_CHARS,
   VECTOR_TOP_K, VECTOR_MIN_SCORE, EMBEDDING_SCHEMA_VERSION,
-  INDEX_JQL_LOWER_BOUND
+  INDEX_JQL_LOWER_BOUND, JIRA_FIELDS
 } from '../shared/constants.js';
 import { quoteJql } from '../shared/utils.js';
+
+// Full field list for indexing — needs description + comments so the
+// embedding text and rerank context have something to chew on, not just
+// summary. JIRA_FIELDS is exported as a comma-joined string for URL use;
+// we split here to pass an array to searchJira.
+const INDEXER_FIELDS = JIRA_FIELDS.split(',').map((s) => s.trim()).filter(Boolean);
 
 const DAY_MS = 86400000;
 
@@ -101,6 +107,10 @@ export async function countScope(config, { exact = false } = {}) {
 }
 
 const EMBED_BATCH = 20; // texts per embed() call during bulk build
+// Max concurrent embed() requests during bulk indexing. 5 batches × 20 texts
+// = 100 tickets in flight per page, balancing throughput against provider
+// rate limits. Tunable — raise if your provider allows it.
+const EMBED_CONCURRENCY = 5;
 
 // Epoch-ms timestamp of the last successful incremental sync. Stored in
 // chrome.storage.local (a single scalar) so syncNewIssues knows the
@@ -203,11 +213,180 @@ export async function embedOneIssue(api, llm, rawIssue) {
   }
 }
 
+// Module-level memo: once a provider is detected as "single-input only"
+// (Ark multimodal etc.), skip the wasted batch call for the rest of this
+// browser session. Reset by reload. Naming the variable with underscore so
+// it's clearly internal.
+let _providerIsSingleInput = false;
+
+/**
+ * Embed a list of (issue, text) pairs in parallel batches.
+ *
+ * Two modes (auto-selected based on provider behavior):
+ *
+ *   BATCH MODE (default, used by OpenAI / Zhipu / Ollama):
+ *     - Split into chunks of EMBED_BATCH (20)
+ *     - Fire up to EMBED_CONCURRENCY (5) chunks in parallel
+ *     - Each chunk = ONE embed() call with 20 texts → 20 vectors
+ *
+ *   PER-ISSUE MODE (auto-enabled after first short-batch response):
+ *     - Some providers (Ark doubao-embedding-vision) accept arrays but only
+ *       return 1 vector regardless. The batch call wastes TPM and trips 429s.
+ *     - Skip the batch call entirely; fire EMBED_CONCURRENCY single-text
+ *       embed() calls in parallel, with proper 429 backoff (handled inside
+ *       llm.embed).
+ *
+ * Returns { vectors: Array<vector|null>, indexed: number, skipped: number }.
+ * Caller is responsible for storing the vectors.
+ */
+async function embedBatchParallel(llm, items) {
+  const vectors = new Array(items.length).fill(null);
+  let indexed = 0;
+  let skipped = 0;
+
+  if (items.length === 0) return { vectors, indexed, skipped };
+
+  // ============================================================
+  // PER-ISSUE MODE — provider doesn't support real batches
+  // ============================================================
+  if (_providerIsSingleInput) {
+    for (let i = 0; i < items.length; i += EMBED_CONCURRENCY) {
+      const slice = items.slice(i, i + EMBED_CONCURRENCY);
+      const results = await Promise.allSettled(
+        slice.map((it) => llm.embed(it.text))
+      );
+      results.forEach((r, j) => {
+        if (r.status === 'fulfilled') {
+          const v = r.value?.[0];
+          if (Array.isArray(v) && v.length) {
+            vectors[i + j] = v;
+            indexed++;
+          } else {
+            skipped++;
+          }
+        } else {
+          skipped++;
+        }
+      });
+    }
+    return { vectors, indexed, skipped };
+  }
+
+  // ============================================================
+  // BATCH MODE — try a real batch call, detect provider quirk
+  // ============================================================
+  // Slice into EMBED_BATCH-sized chunks
+  const chunks = [];
+  for (let i = 0; i < items.length; i += EMBED_BATCH) {
+    chunks.push({ start: i, items: items.slice(i, i + EMBED_BATCH) });
+  }
+
+  // Process chunks with bounded concurrency
+  for (let i = 0; i < chunks.length; i += EMBED_CONCURRENCY) {
+    const wave = chunks.slice(i, i + EMBED_CONCURRENCY);
+    const waveResults = await Promise.allSettled(
+      wave.map(async (chunk) => {
+        const texts = chunk.items.map((it) => it.text);
+        let vecs = null;
+        let shortResponse = false;
+        try {
+          const out = await llm.embed(texts);
+          if (Array.isArray(out) && out.length === texts.length) {
+            vecs = out;
+          } else if (Array.isArray(out) && out.length > 0 && out.length < texts.length) {
+            // Provider returned short — Ark multimodal signature.
+            // Switch to PER-ISSUE mode for the rest of this build AND future
+            // builds in this session.
+            shortResponse = true;
+            console.warn('[indexer] provider returned %d/%d — switching to per-issue mode', out.length, texts.length);
+          }
+        } catch (err) {
+          // Network/429/5xx errors handled by llm.embed retry. If it still
+          // throws, fall through to per-issue below for this chunk.
+          console.warn('[indexer] batch embed failed (%d texts): %s', texts.length, err.message);
+        }
+
+        if (shortResponse) {
+          // Trigger mode switch + per-issue fallback for THIS chunk
+          _providerIsSingleInput = true;
+          vecs = await embedChunkPerIssue(llm, chunk.items);
+        } else if (!vecs) {
+          // Transient failure — try per-issue for this chunk only
+          vecs = await embedChunkPerIssue(llm, chunk.items);
+        }
+
+        return { start: chunk.start, vecs };
+      })
+    );
+
+    for (let w = 0; w < waveResults.length; w++) {
+      const r = waveResults[w];
+      if (r.status !== 'fulfilled' || !r.value?.vecs) {
+        const chunk = wave[w];
+        skipped += chunk.items.length;
+        continue;
+      }
+      const { start, vecs } = r.value;
+      for (let j = 0; j < vecs.length; j++) {
+        const v = vecs[j];
+        if (Array.isArray(v) && v.length) {
+          vectors[start + j] = v;
+          indexed++;
+        } else {
+          skipped++;
+        }
+      }
+    }
+
+    // If the first wave flipped us into per-issue mode, abandon batching for
+    // the remaining chunks and process them per-issue instead.
+    if (_providerIsSingleInput && i + EMBED_CONCURRENCY < chunks.length) {
+      const remaining = chunks.slice(i + EMBED_CONCURRENCY).flatMap((c) => c.items);
+      // Offset by how many items we've already placed
+      const offset = i + EMBED_CONCURRENCY; // chunk index offset (not item index)
+      const itemOffset = (i + EMBED_CONCURRENCY) * EMBED_BATCH;
+      const { vectors: tailVecs, indexed: tailIdx, skipped: tailSkp } = await embedBatchParallel(llm, remaining);
+      for (let k = 0; k < tailVecs.length; k++) {
+        if (Array.isArray(tailVecs[k]) && tailVecs[k].length) {
+          vectors[itemOffset + k] = tailVecs[k];
+        }
+      }
+      indexed += tailIdx;
+      skipped += tailSkp;
+      break;
+    }
+  }
+
+  return { vectors, indexed, skipped };
+}
+
+/**
+ * Per-issue embed helper for a chunk's items. Returns array (same length as
+ * items) of vector|null. Concurrency-bounded to EMBED_CONCURRENCY.
+ */
+async function embedChunkPerIssue(llm, chunkItems) {
+  const out = new Array(chunkItems.length).fill(null);
+  for (let i = 0; i < chunkItems.length; i += EMBED_CONCURRENCY) {
+    const slice = chunkItems.slice(i, i + EMBED_CONCURRENCY);
+    const results = await Promise.allSettled(
+      slice.map((it) => llm.embed(it.text))
+    );
+    results.forEach((r, j) => {
+      if (r.status === 'fulfilled') {
+        const v = r.value?.[0];
+        if (Array.isArray(v) && v.length) out[i + j] = v;
+      }
+    });
+  }
+  return out;
+}
+
 /**
  * Bulk-build (or rebuild) the local similarity index.
  *
- * Fetches tickets ordered by most-recently-updated, embeds them in batches via
- * the embedding endpoint, and stores vectors in IndexedDB. Existing vectors for
+ * Fetches tickets ordered by most-recently-updated, embeds them in parallel
+ * batches via the embedding endpoint (EMBED_BATCH texts × EMBED_CONCURRENCY
+ * concurrent requests), and stores vectors in IndexedDB. Existing vectors for
  * the same key are overwritten (idempotent), so calling this again refreshes
  * changed tickets without duplication.
  *
@@ -237,6 +416,10 @@ export async function buildIndex(config, opts = {}) {
     statuses: config.indexStatuses
   });
   let startAt = 0;
+  let pageToken = null;
+  // Enhanced search uses nextPageToken; classic falls back to startAt. The
+  // API tells us which by returning (or omitting) a token in the response.
+  let useStartAtFallback = false;
   let seen = 0;
   let indexed = 0;
   let skipped = 0;
@@ -245,75 +428,53 @@ export async function buildIndex(config, opts = {}) {
   onProgress({ phase: 'start', seen: 0, indexed: 0 });
 
   while (seen < maxIssues) {
-    const res = await api.searchJira(jql, INDEX_PAGE_SIZE, startAt);
+    // Build the page-fetch opts based on which pagination mode is active.
+    // We always ask for the full field set (incl description/comment) so the
+    // embedding text and rerank context have body content to work with.
+    const pageOpts = useStartAtFallback
+      ? { startAt, fields: INDEXER_FIELDS }
+      : { pageToken, fields: INDEXER_FIELDS };
+    const res = await api.searchJira(jql, INDEX_PAGE_SIZE, pageOpts);
     const issues = res.issues || [];
     if (issues.length === 0) break;
 
-    // Batch embed for throughput. If the provider returns fewer vectors than
-    // inputs (Ark multimodal only supports single-input), fall back to
-    // per-issue embedding one at a time.
     const batch = issues.slice(0, maxIssues - seen);
-    const texts = batch.map((iss) => issueToEmbedText(simplifyIssue(iss)));
-    let vectors = null;
-    try {
-      vectors = await llm.embed(texts);
-      // Verify we got one vector per input — if not, fall through to sequential
-      if (!Array.isArray(vectors) || vectors.length < texts.length) {
-        console.warn('[indexer] batch embed returned %d/%d vectors, falling back to sequential', vectors?.length || 0, texts.length);
-        vectors = null;
-      }
-    } catch (batchErr) {
-      console.warn('[indexer] batch embed failed, falling back to per-issue:', batchErr.message);
-    }
+    const items = batch.map((iss) => {
+      const simplified = simplifyIssue(iss);
+      return { issue: iss, simplified, text: issueToEmbedText(simplified) };
+    });
 
-    if (!vectors) {
-      // Sequential embed with controlled concurrency: fire N requests in
-      // parallel (but no more than CONCURRENCY at once to avoid rate limits).
-      const CONCURRENCY = 5;
-      for (let i = 0; i < batch.length; i += CONCURRENCY) {
-        const chunk = batch.slice(i, i + CONCURRENCY);
-        const chunkTexts = texts.slice(i, i + CONCURRENCY);
-        const results = await Promise.allSettled(
-          chunk.map((_, ci) => llm.embed(chunkTexts[ci]))
-        );
-        for (let ci = 0; ci < results.length; ci++) {
-          const r = results[ci];
-          if (r.status === 'fulfilled') {
-            const v = r.value?.[0];
-            if (Array.isArray(v) && v.length) {
-              await storeVector(llm, chunk[ci], v, chunkTexts[ci]);
-              indexed++; dims = dims || v.length;
-            } else {
-              skipped++;
-            }
-          } else {
-            skipped++;
-          }
-        }
-        onProgress({ phase: 'progress', seen: seen + indexed + skipped, indexed, skipped });
-      }
-      seen += batch.length;
-      startAt += batch.length;
-      if (batch.length < INDEX_PAGE_SIZE) break;
-      continue;
-    }
+    const t0 = Date.now();
+    const { vectors, indexed: idx, skipped: skp } = await embedBatchParallel(llm, items);
+    console.log('[indexer] embedded %d tickets (%d ok, %d skipped) in %dms', batch.length, idx, skp, Date.now() - t0);
 
     for (let i = 0; i < batch.length; i++) {
       const v = vectors[i];
       if (Array.isArray(v) && v.length) {
-        await storeVector(llm, batch[i], v, texts[i]);
-        indexed++;
+        await storeVector(llm, batch[i], v, items[i].text);
         dims = dims || v.length;
-      } else {
-        skipped++;
       }
     }
+    indexed += idx;
+    skipped += skp;
 
     seen += batch.length;
-    startAt += batch.length;
+
+    // Advance pagination. Prefer nextPageToken (enhanced search); fall back
+    // to startAt when the instance doesn't return tokens.
+    if (res.nextPageToken) {
+      pageToken = res.nextPageToken;
+    } else {
+      useStartAtFallback = true;
+      startAt += batch.length;
+    }
+
     onProgress({ phase: 'progress', seen, indexed, skipped });
 
-    if (batch.length < INDEX_PAGE_SIZE) break;
+    // Stop conditions: explicit isLast, short page with no continuation,
+    // or no token AND classic pagination exhausted.
+    if (res.isLast) break;
+    if (!res.nextPageToken && batch.length < INDEX_PAGE_SIZE) break;
   }
 
   onProgress({ phase: 'done', seen, indexed, skipped });
@@ -365,51 +526,33 @@ export async function syncNewIssues(config, opts = {}) {
   });
 
   let startAt = 0;
+  let pageToken = null;
+  let useStartAtFallback = false;
   let synced = 0;
   let skipped = 0;
   let maxUpdated = since;
 
   onProgress({ phase: 'sync-start', synced: 0, skipped: 0 });
   while (synced + skipped < maxIssues) {
-    const res = await api.searchJira(jql, INDEX_PAGE_SIZE, startAt);
+    const pageOpts = useStartAtFallback
+      ? { startAt, fields: INDEXER_FIELDS }
+      : { pageToken, fields: INDEXER_FIELDS };
+    const res = await api.searchJira(jql, INDEX_PAGE_SIZE, pageOpts);
     const issues = res.issues || [];
     if (issues.length === 0) break;
 
     const batch = issues.slice(0, maxIssues - synced - skipped);
-    const texts = batch.map((iss) => issueToEmbedText(simplifyIssue(iss)));
+    const items = batch.map((iss) => {
+      const simplified = simplifyIssue(iss);
+      return { issue: iss, simplified, text: issueToEmbedText(simplified) };
+    });
 
-    // Batch embed for throughput (same as buildIndex). Fall back to per-issue
-    // embedding if the batch call fails so one bad ticket doesn't block sync.
-    let vectors = null;
-    try {
-      vectors = await llm.embed(texts);
-    } catch (batchErr) {
-      console.warn('[indexer] sync batch embed failed, falling back to per-issue:', batchErr.message);
-      for (let i = 0; i < batch.length; i++) {
-        try {
-          const [v] = await llm.embed(texts[i]);
-          if (Array.isArray(v) && v.length) {
-            await storeVector(llm, batch[i], v, texts[i]);
-            synced++;
-            const u = Date.parse(batch[i]?.fields?.updated);
-            if (u) maxUpdated = Math.max(maxUpdated, u);
-          } else {
-            skipped++;
-          }
-        } catch {
-          skipped++;
-        }
-      }
-      startAt += batch.length;
-      onProgress({ phase: 'sync-progress', synced, skipped });
-      if (batch.length < INDEX_PAGE_SIZE) break;
-      continue;
-    }
+    const { vectors, skipped: skp } = await embedBatchParallel(llm, items);
 
     for (let i = 0; i < batch.length; i++) {
       const v = vectors[i];
       if (Array.isArray(v) && v.length) {
-        await storeVector(llm, batch[i], v, texts[i]);
+        await storeVector(llm, batch[i], v, items[i].text);
         synced++;
         const u = Date.parse(batch[i]?.fields?.updated);
         if (u) maxUpdated = Math.max(maxUpdated, u);
@@ -418,9 +561,16 @@ export async function syncNewIssues(config, opts = {}) {
       }
     }
 
-    startAt += batch.length;
+    if (res.nextPageToken) {
+      pageToken = res.nextPageToken;
+    } else {
+      useStartAtFallback = true;
+      startAt += batch.length;
+    }
+
     onProgress({ phase: 'sync-progress', synced, skipped });
-    if (batch.length < INDEX_PAGE_SIZE) break;
+    if (res.isLast) break;
+    if (!res.nextPageToken && batch.length < INDEX_PAGE_SIZE) break;
   }
 
   await setLastSyncAt(maxUpdated || Date.now());
