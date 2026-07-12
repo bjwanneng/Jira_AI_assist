@@ -249,15 +249,25 @@ export async function buildIndex(config, opts = {}) {
     const issues = res.issues || [];
     if (issues.length === 0) break;
 
-    // Batch embed for throughput. If a whole batch fails, fall back to
-    // per-issue embedding so one bad ticket doesn't sink the build.
+    // Batch embed for throughput. If the provider returns fewer vectors than
+    // inputs (Ark multimodal only supports single-input), fall back to
+    // per-issue embedding one at a time.
     const batch = issues.slice(0, maxIssues - seen);
     const texts = batch.map((iss) => issueToEmbedText(simplifyIssue(iss)));
     let vectors = null;
     try {
       vectors = await llm.embed(texts);
+      // Verify we got one vector per input — if not, fall through to sequential
+      if (!Array.isArray(vectors) || vectors.length < texts.length) {
+        console.warn('[indexer] batch embed returned %d/%d vectors, falling back to sequential', vectors?.length || 0, texts.length);
+        vectors = null;
+      }
     } catch (batchErr) {
       console.warn('[indexer] batch embed failed, falling back to per-issue:', batchErr.message);
+    }
+
+    if (!vectors) {
+      // Sequential embed: one text at a time (Ark multimodal requires this)
       for (let i = 0; i < batch.length; i++) {
         try {
           const [v] = await llm.embed(texts[i]);
@@ -269,6 +279,10 @@ export async function buildIndex(config, opts = {}) {
           }
         } catch {
           skipped++;
+        }
+        // Progress update every 10 tickets during sequential embed
+        if ((indexed + skipped) % 10 === 0) {
+          onProgress({ phase: 'progress', seen: seen + indexed + skipped, indexed, skipped });
         }
       }
       seen += batch.length;
