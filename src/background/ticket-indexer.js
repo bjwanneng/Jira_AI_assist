@@ -267,27 +267,33 @@ export async function buildIndex(config, opts = {}) {
     }
 
     if (!vectors) {
-      // Sequential embed: one text at a time (Ark multimodal requires this)
-      for (let i = 0; i < batch.length; i++) {
-        try {
-          const [v] = await llm.embed(texts[i]);
-          if (Array.isArray(v) && v.length) {
-            await storeVector(llm, batch[i], v, texts[i]);
-            indexed++; dims = dims || v.length;
+      // Sequential embed with controlled concurrency: fire N requests in
+      // parallel (but no more than CONCURRENCY at once to avoid rate limits).
+      const CONCURRENCY = 5;
+      for (let i = 0; i < batch.length; i += CONCURRENCY) {
+        const chunk = batch.slice(i, i + CONCURRENCY);
+        const chunkTexts = texts.slice(i, i + CONCURRENCY);
+        const results = await Promise.allSettled(
+          chunk.map((_, ci) => llm.embed(chunkTexts[ci]))
+        );
+        for (let ci = 0; ci < results.length; ci++) {
+          const r = results[ci];
+          if (r.status === 'fulfilled') {
+            const v = r.value?.[0];
+            if (Array.isArray(v) && v.length) {
+              await storeVector(llm, chunk[ci], v, chunkTexts[ci]);
+              indexed++; dims = dims || v.length;
+            } else {
+              skipped++;
+            }
           } else {
             skipped++;
           }
-        } catch {
-          skipped++;
         }
-        // Progress update every 10 tickets during sequential embed
-        if ((indexed + skipped) % 10 === 0) {
-          onProgress({ phase: 'progress', seen: seen + indexed + skipped, indexed, skipped });
-        }
+        onProgress({ phase: 'progress', seen: seen + indexed + skipped, indexed, skipped });
       }
       seen += batch.length;
       startAt += batch.length;
-      onProgress({ phase: 'progress', seen, indexed, skipped });
       if (batch.length < INDEX_PAGE_SIZE) break;
       continue;
     }
