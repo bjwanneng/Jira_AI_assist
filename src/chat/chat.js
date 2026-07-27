@@ -25,13 +25,6 @@ const srcConfluence = document.getElementById('src-confluence');
 const srcSlack = document.getElementById('src-slack');
 
 const weeklyBtn = document.getElementById('weekly-summary-btn');
-const weeklyView = document.getElementById('weekly-view');
-const weeklyBack = document.getElementById('weekly-back');
-const weeklyGenerate = document.getElementById('weekly-generate');
-const weeklyCopy = document.getElementById('weekly-copy');
-const weeklyOutput = document.getElementById('weekly-output');
-const messagesContainer = document.getElementById('messages');
-const loadingContainer = document.getElementById('loading');
 
 const contextState = new ContextState('global');
 
@@ -86,10 +79,6 @@ function handleStreamDelta(payload) {
 // ---------- Conversation management ----------
 
 async function startNewConversation() {
-  // Hide weekly view if visible - switching to chat should always show messages.
-  weeklyView.classList.add('hidden');
-  messagesContainer.classList.remove('hidden');
-
   // Read current source flags from the UI before creating.
   const sourceFlags = collectSourceFlags();
   const conv = await createConversation('New conversation', { sourceFlags });
@@ -142,9 +131,6 @@ async function clearBackendConversations() {
 async function switchConversation(id) {
   const conv = await getConversation(id);
   if (!conv) return;
-  // Hide weekly view if visible - switching to chat should always show messages.
-  weeklyView.classList.add('hidden');
-  messagesContainer.classList.remove('hidden');
 
   activeConversationId = id;
   await setActiveConversationId(id);
@@ -620,73 +606,8 @@ clearHistoryBtn.addEventListener('click', async () => {
 // ---------- Weekly Summary ----------
 
 weeklyBtn.addEventListener('click', () => {
-  messagesContainer.classList.add('hidden');
-  loadingContainer.classList.add('loading-hidden');
-  weeklyView.classList.remove('hidden');
-  currentTitle.textContent = 'Weekly Summary';
+  chrome.tabs.create({ url: chrome.runtime.getURL('src/weekly/weekly.html') });
 });
-
-weeklyBack.addEventListener('click', async () => {
-  weeklyView.classList.add('hidden');
-  messagesContainer.classList.remove('hidden');
-  if (activeConversationId) {
-    const conv = await getConversation(activeConversationId);
-    currentTitle.textContent = conv?.title || 'Conversation';
-  } else {
-    currentTitle.textContent = 'New conversation';
-  }
-});
-
-weeklyGenerate.addEventListener('click', async () => {
-  weeklyGenerate.disabled = true;
-  weeklyCopy.disabled = true;
-  weeklyOutput.innerHTML = '<div class="loading-card"><div class="spinner"></div><span>Loading open tickets and summarizing...</span></div>';
-
-  try {
-    const response = await chrome.runtime.sendMessage({
-      type: MESSAGE_TYPES.WEEKLY_SUMMARY,
-      payload: {}
-    });
-    if (response?.success) {
-      renderWeeklyReport(response.data);
-      weeklyCopy.disabled = false;
-    } else {
-      const errMsg = normalizeErrMsg(response?.error?.message || response?.error, 'Failed to generate weekly summary.');
-      weeklyOutput.innerHTML = `<div class="weekly-error">⚠️ ${escapeHtml(errMsg)}</div>`;
-    }
-  } catch (err) {
-    const errMsg = normalizeErrMsg(err?.message ?? err, 'Failed to reach background service.');
-    weeklyOutput.innerHTML = `<div class="weekly-error">⚠️ ${escapeHtml(errMsg)}</div>`;
-  } finally {
-    weeklyGenerate.disabled = false;
-  }
-});
-
-weeklyCopy.addEventListener('click', async () => {
-  const md = weeklyOutput.dataset.markdown;
-  if (!md) return;
-  try {
-    await navigator.clipboard.writeText(md);
-    const prev = weeklyCopy.textContent;
-    weeklyCopy.textContent = 'Copied ✓';
-    setTimeout(() => { weeklyCopy.textContent = prev; }, 1500);
-  } catch {
-    weeklyCopy.textContent = 'Copy failed';
-    setTimeout(() => { weeklyCopy.textContent = 'Copy as Markdown'; }, 1500);
-  }
-});
-
-function renderWeeklyReport(data) {
-  if (!data) {
-    weeklyOutput.innerHTML = '<p class="weekly-empty">No data returned.</p>';
-    return;
-  }
-  const warningsHtml = (data.warnings && data.warnings.length)
-    ? `<div class="weekly-warnings">${data.warnings.map(w => `<div>⚠ ${escapeHtml(w)}</div>`).join('')}</div>`
-    : '';
-  weeklyOutput.dataset.markdown = data.markdown || '';
-  weeklyOutput.innerHTML = warningsHtml + '<div class="weekly-markdown">' + renderMarkdown(data.markdown || '') + '</div>';
-}
 
 // ---------- Init ----------
 

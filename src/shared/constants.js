@@ -15,6 +15,9 @@ export const STORAGE_KEYS = {
   LLM_CHEAP_MODEL: 'llmCheapModel',
   LLM_MAX_TOKENS: 'llmMaxTokens',
   LLM_TEMPERATURE: 'llmTemperature',
+  LLM_ROLE: 'llmRole',
+  JIRA_USER_DISPLAY_NAME: 'jiraUserDisplayName',
+  JIRA_USER_EMAIL: 'jiraUserEmail',
   EMBEDDING_MODEL: 'embeddingModel',
   EMBEDDING_BASE_URL: 'embedBaseUrl',
   EMBEDDING_API_KEY: 'embedApiKey',
@@ -38,6 +41,7 @@ export const DEFAULT_SETTINGS = {
   [STORAGE_KEYS.LLM_CHEAP_MODEL]: '',
   [STORAGE_KEYS.LLM_MAX_TOKENS]: 0,
   [STORAGE_KEYS.LLM_TEMPERATURE]: 0.3,
+  [STORAGE_KEYS.LLM_ROLE]: '',
   [STORAGE_KEYS.EMBEDDING_MODEL]: 'text-embedding-3-small',
   [STORAGE_KEYS.EMBEDDING_DIMS]: 0,
   [STORAGE_KEYS.EMBEDDING_API_STYLE]: 'openai',
@@ -69,7 +73,11 @@ export const MAX_COMMENTS = 20;
 export const LLM_TIMEOUT_MS = 60000;
 
 // Hybrid search + rerank pipeline tuning.
-export const MAX_RERANK_CANDIDATES = 200;
+// MAX_RERANK_CANDIDATES=80 — caps how many issues get sent to the reranker.
+// Each candidate becomes ~320 chars in the prompt; 80 candidates / BATCH_SIZE=25
+// = 4 batches × ~4s = ~16s rerank, vs 13 batches × 4s = 53s at 125/200.
+// 80 is plenty for "find similar" — top results surface within the top 30-50.
+export const MAX_RERANK_CANDIDATES = 80;
 export const MAX_RERANKED_RESULTS = 100;
 export const RRF_K = 60;
 

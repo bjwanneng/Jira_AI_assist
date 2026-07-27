@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Weekly Summary — Jira AI Assistant</title>
+  <link rel="stylesheet" href="weekly.css">
+</head>
+<body>
+  <div class="weekly-page">
+    <header class="weekly-header">
+      <h1>Weekly Summary</h1>
+      <a class="weekly-back-chat" href="../chat/chat.html" title="Back to chat">← Back to chat</a>
+    </header>
+
+    <div class="weekly-toolbar">
+      <button id="weekly-generate" class="weekly-generate">Generate</button>
+      <button id="weekly-copy" class="weekly-copy" disabled>Copy as Markdown</button>
+      <a href="../options/options.html" target="_blank" class="weekly-settings-link">Settings</a>
+    </div>
+
+    <div id="weekly-permission" class="weekly-permission hidden">
+      <div class="weekly-permission-text"></div>
+      <button id="weekly-authorize" class="weekly-authorize">Authorize LLM Host</button>
+    </div>
+
+    <div id="weekly-output" class="weekly-output">
+      <p class="weekly-empty">Click <strong>Generate</strong> to build this week's summary from your open tickets.</p>
+    </div>
+  </div>
+  <script type="module" src="weekly.js"></script>
+</body>
+</html>

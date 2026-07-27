@@ -133,12 +133,19 @@ async function handleChatMessage(message, sender) {
     const data = await orchestrator.handle(message.payload, onDelta);
     sendDone({ success: true, data });
   } catch (err) {
+    // Defensive: if a code path rejects with a non-Error value (e.g. a leaked
+    // Promise from a missing `await`, or `Promise.reject(null)`), `err.message`
+    // is undefined and the UI would show opaque JSON like {"code":null,...}.
+    // Coerce to a readable string so future bugs surface clearly.
+    const errMessage = (err && typeof err.message === 'string' && err.message)
+      || (typeof err === 'string' && err)
+      || (err && typeof err === 'object' ? `Non-Error rejection: ${err.constructor?.name || 'Object'}` : String(err || 'Unknown error'));
     sendDone({
       success: false,
       error: {
-        message: err.message,
-        code: err.code || null,
-        llmBaseUrl: err.llmBaseUrl || null
+        message: errMessage,
+        code: err?.code || null,
+        llmBaseUrl: err?.llmBaseUrl || null
       }
     });
   }
@@ -334,6 +341,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           try {
             const count = await indexCount();
             return sendResponse({ success: true, count });
+          } catch (err) {
+            return sendResponse({ success: false, error: err.message });
+          }
+        }
+
+        case MESSAGE_TYPES.FETCH_JIRA_USER: {
+          const config = await loadConfig();
+          if (!config.jiraBaseUrl || !config.jiraApiToken) {
+            return sendResponse({ success: false, error: 'Jira not configured.' });
+          }
+          try {
+            const api = new ApiClient(config);
+            const myself = await api.testJiraConnection();
+            return sendResponse({ success: true, displayName: myself.displayName, email: myself.emailAddress });
           } catch (err) {
             return sendResponse({ success: false, error: err.message });
           }

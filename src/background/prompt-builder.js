@@ -135,9 +135,22 @@ export function buildSystemPrompt(config = {}) {
 
   const enabledSources = Object.entries(flags).filter(([, v]) => v).map(([k]) => k).join(', ');
 
-  return `You are a technical support analyst assistant with access to Jira, Confluence, Slack, Google Drive, and the web. Your job is to help the user understand customer tickets, find related context, read web pages, and draft replies.
+  const role = config.llmRole;
+  const roleLine = role
+    ? `${role}
+`
+    : `You are a technical support analyst assistant with access to Jira, Confluence, Slack, Google Drive, and the web. Your job is to help the user understand customer tickets, find related context, read web pages, and draft replies.
+`;
 
-This is a chip-design / RISC-V / EDA support context. Users will reference domain abbreviations - always expand them when forming search queries:
+  const userName = config.jiraUserDisplayName;
+  const userEmail = config.jiraUserEmail;
+  const userLine = (userName || userEmail)
+    ? `Current user: ${userName || 'Unknown'}${userEmail ? ` (${userEmail})` : ''}.
+When the user refers to "me", "my tickets", "my issues", or "assigned to me", use this identity for the reporter/assignee fields.
+`
+    : '';
+
+  return `${roleLine}${userLine}This is a chip-design / RISC-V / EDA support context. Users will reference domain abbreviations - always expand them when forming search queries:
   PD = Physical Design (floorplan, placement, P&R, routing, timing closure, ECO)
   STA = Static Timing Analysis (setup, hold, slack, TNS, WNS)
   CDC = Clock Domain Crossing (metastability, async)
@@ -177,17 +190,12 @@ How to use tools:
 - When the user asks about BROAD TRENDS or RECURRING PATTERNS across many tickets — e.g. "what common issues appear in EHT P870 tickets?", "what patterns do you see in S5CSD timing bugs?", "summarize recurring problems in this project" — call \`analyze_ticket_patterns\`. It pulls 30-40 tickets and groups them into thematic patterns with root causes, quantitative evidence, and recommendations. Do NOT use it for "find tickets similar to this one" — that's \`find_similar_issues\`.
 - After loading context, you can call \`suggest_reply\` or \`summarize_context\` if helpful, or just answer directly.
 
-Before calling a tool, ALWAYS do a brief reasoning step first. Two ways to do this:
+CRITICAL — Reasoning must be ONE short sentence (under 20 words). Your thinking/reasoning_content must be brief. NEVER analyze why a previous call failed, NEVER repeat the user's request, NEVER meta-comment on the task. Just state the tool name and the key argument, then output the tool call JSON. If you previously produced a truncated tool call, do NOT explain it — just emit the JSON immediately with no reasoning.
 
 (A) Reasoning before a tool call. Use this exact format:
 \`\`\`
 <reasoning>
-What the user is really asking for, what I know, what's missing, and which tool + keywords to use.
-- Intent: ...
-- Known facts: ...
-- Missing info: ...
-- Search keywords I'll extract: word1, word2, word3
-- Plan: call search_jira with these keywords, then read top results
+[1-2 sentences max. What tool and why.]
 </reasoning>
 
 \`\`\`json
@@ -196,7 +204,7 @@ What the user is really asking for, what I know, what's missing, and which tool 
 (B) Final answer when no more tools are needed. Use:
 \`\`\`
 <reasoning>
-Brief synthesis of what I learned from the tools and how I'll structure the answer.
+[1-2 sentences: brief synthesis.]
 </reasoning>
 
 [Final markdown answer here, following the Output format guidelines]
@@ -426,20 +434,24 @@ export function looksLikeTruncatedToolCall(content) {
 
 /**
  * Extract the <reasoning>...</reasoning> block from a model response.
- * Returns the inner text, or null if absent.
+ * Returns the inner text, or null if absent. Tolerates a truncated close
+ * tag (`</reasoning` missing the `>`) — happens when max_tokens hits
+ * mid-tag, which previously left reasoning unparsed and leaked raw tags
+ * into the final answer.
  * @param {string} content
  * @returns {string|null}
  */
 export function parseReasoning(content) {
   if (!content) return null;
-  const m = content.match(/<reasoning>([\s\S]*?)<\/reasoning>/);
+  const m = content.match(/<reasoning>([\s\S]*?)(?:<\/reasoning>|<\/reasoning?$|$)/);
   if (!m) return null;
   return m[1].trim();
 }
 
 /**
  * Strip the <reasoning> block and the JSON tool-call block from a model response,
- * returning only the human-facing markdown.
+ * returning only the human-facing markdown. Also strips an UNCLOSED <reasoning>
+ * block (response truncated mid-tag before </reasoning> was emitted).
  * @param {string} content
  * @returns {string}
  */
@@ -447,6 +459,7 @@ export function stripMeta(content) {
   if (!content) return '';
   return content
     .replace(/<reasoning>[\s\S]*?<\/reasoning>/g, '')
+    .replace(/<reasoning>[\s\S]*$/g, '')
     .replace(/```json\s*\{[\s\S]*?"tool_calls"[\s\S]*?\}\s*```/g, '')
     .replace(/\{[\s\S]*?"tool_calls"[\s\S]*?\}/g, '')
     .replace(/^\s+|\s+$/g, '');

@@ -57,10 +57,23 @@ input {
   border-radius: 4px;
 }
 
-input:focus {
+input:focus,
+textarea:focus {
   outline: none;
   border-color: #4c9aff;
   box-shadow: 0 0 0 2px rgba(76, 154, 255, 0.25);
+}
+
+textarea {
+  display: block;
+  width: 100%;
+  margin-top: 6px;
+  padding: 10px 12px;
+  font-size: 14px;
+  border: 1px solid #dfe1e6;
+  border-radius: 4px;
+  font-family: inherit;
+  resize: vertical;
 }
 
 .hint {

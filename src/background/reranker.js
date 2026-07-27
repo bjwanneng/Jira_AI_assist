@@ -177,10 +177,11 @@ export async function rerankCandidates(source, candidates, llm, opts = {}) {
   }
 
   // Process in batches to handle large candidate pools without truncation.
-  // BATCH_SIZE=10 because each candidate now carries summary + description
-  // excerpt + comment (~320 chars) — 10 × 320 = 3.2k chars per batch, leaving
-  // ample headroom in the cheap model's context window.
-  const BATCH_SIZE = 10;
+  // BATCH_SIZE=25: each candidate carries summary + description excerpt +
+  // comment (~320 chars) → 25 × 320 = 8k chars per batch, well within cheap
+  // model context. Larger batch = fewer LLM calls = lower total latency,
+  // especially when the cheap model falls back to a slow reasoning model.
+  const BATCH_SIZE = 25;
   const batches = [];
   for (let i = 0; i < allCandidates.length; i += BATCH_SIZE) {
     batches.push(allCandidates.slice(i, i + BATCH_SIZE));
@@ -191,11 +192,23 @@ export async function rerankCandidates(source, candidates, llm, opts = {}) {
   const batchResults = await Promise.all(
     batches.map(async (batch, batchIdx) => {
       try {
+        // Rerank output is just a JSON array of {key, score, reason}. Cap
+        // max_tokens at 1500 so a reasoning-model fallback (e.g. doubao-seed
+        // when no llmCheapModel is configured) doesn't burn 2k tokens on CoT
+        // before emitting the array — that's the difference between a 4s
+        // rerank batch and a 15s one at scale.
         const response = await llm.chatCheap([
           { role: 'system', content: RERANKER_SYSTEM_PROMPT },
           { role: 'user', content: buildRerankerUserPrompt(renderSourceBlock(source), batch) }
-        ]);
+        ], { maxTokens: 1500, temperature: 0 });
         const scoreMap = buildScoreMap(parseLlmJson(response?.content || ''));
+        if (scoreMap.size === 0) {
+          // Parse failed or the JSON array was truncated (25 candidates ×
+          // {key, score, reason} can exceed the 1500-token cap). Without this
+          // log the whole batch silently degrades to score 0.
+          console.warn('[reranker] batch %d: no scores parsed from response (%d chars, finish_reason=%s) — candidates fall back to RRF order',
+            batchIdx, (response?.content || '').length, response?.finish_reason || 'unknown');
+        }
         return batch.map((c) => {
           const entry = scoreMap.get(c.key) || { score: 0, reason: '' };
           return {

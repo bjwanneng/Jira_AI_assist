@@ -256,7 +256,8 @@ export class LlmClient {
 
   async chat(messages, options = {}) {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), LLM_TIMEOUT_MS);
+    const timeoutMs = options.timeoutMs || LLM_TIMEOUT_MS;
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
     try {
       const body = {
@@ -302,7 +303,7 @@ export class LlmClient {
       return msg;
     } catch (err) {
       clearTimeout(timeoutId);
-      throw await this._wrapError(err);
+      throw await this._wrapError(err, timeoutMs);
     }
   }
 
@@ -443,7 +444,12 @@ export class LlmClient {
     } catch (err) {
       clearTimeout(idleTimer);
       clearTimeout(totalTimer);
-      throw this._wrapError(err);
+      console.error('[llm-client] chatStream error', err.message || err);
+      // Must `await` _wrapError — it's async. Without await, `throw promise`
+      // rejects the outer with the Promise object itself (whose .message is
+      // undefined), surfacing as opaque {"code":null,"llmBaseUrl":null} in
+      // the chat UI. The chat() path on line 306 already uses await.
+      throw await this._wrapError(err);
     }
   }
 
@@ -451,9 +457,10 @@ export class LlmClient {
    * Normalize fetch errors (timeout, host permission, network) into messages
    * the chat UI can act on. Shared between chat() and chatStream().
    */
-  async _wrapError(err) {
+  async _wrapError(err, timeoutMs) {
     if (err.name === 'AbortError') {
-      return new Error('LLM request timed out after 60 seconds.');
+      const secs = Math.round((timeoutMs || LLM_TIMEOUT_MS) / 1000);
+      return new Error(`LLM request timed out after ${secs} seconds.`);
     }
     // Chrome's fetch() throws a TypeError "Failed to fetch" for a wide range
     // of network/DNS/CORS/permission/certificate failures. Check host
@@ -493,7 +500,8 @@ export class LlmClient {
   async chatCheap(messages, options = {}) {
     return this.chat(messages, {
       ...options,
-      model: this.cheapModel || this.model
+      model: this.cheapModel || this.model,
+      timeoutMs: options.timeoutMs || 120000
     });
   }
 

@@ -37,6 +37,10 @@ function collectFormValues() {
   const settings = {};
 
   for (const key of allKeys) {
+    // Keys with no form control (e.g. JIRA_USER_DISPLAY_NAME / JIRA_USER_EMAIL,
+    // written by the Auto-fetch button) are managed outside this form — leave
+    // them untouched instead of clearing them to ''.
+    if (!form.elements[key]) continue;
     const value = formData.get(key);
     if (value !== null && value !== '') {
       if (key === STORAGE_KEYS.LLM_MAX_TOKENS || key === STORAGE_KEYS.LLM_TEMPERATURE ||
@@ -370,6 +374,36 @@ chrome.runtime.onMessage.addListener((message) => {
         indexProgress.value = Math.min(100, Math.round((p.indexed / p.seen) * 100));
       }
     }
+  }
+});
+
+// --- AI Role auto-fetch ---
+document.getElementById('fetch-jira-user').addEventListener('click', async () => {
+  const jiraUserStatus = document.getElementById('jira-user-status');
+  jiraUserStatus.textContent = 'Fetching...';
+  try {
+    await saveSettings();
+    const response = await chrome.runtime.sendMessage({ type: MESSAGE_TYPES.FETCH_JIRA_USER });
+    if (response && response.success) {
+      const { displayName, email } = response;
+      // Name/email are injected into the system prompt via the dedicated
+      // "Current user" line (prompt-builder), so the role text stays generic
+      // — avoids duplicating identity in two places that can drift apart.
+      const roleText = 'You are a support engineer with access to Jira, Confluence, Slack, Google Drive, and the web. Your job is to help understand customer tickets, find related context, read web pages, and draft replies.';
+      document.querySelector('[name="llmRole"]').value = roleText;
+      await chrome.storage.local.set({
+        [STORAGE_KEYS.JIRA_USER_DISPLAY_NAME]: displayName,
+        [STORAGE_KEYS.JIRA_USER_EMAIL]: email || ''
+      });
+      // Persist the textarea we just filled — otherwise the role is lost on
+      // reload unless the user also clicks Save.
+      await saveSettings();
+      showStatus(jiraUserStatus, `Role set from Jira user: ${displayName}${email ? ` (${email})` : ''}`);
+    } else {
+      showStatus(jiraUserStatus, response?.error || 'Failed to fetch Jira user', true);
+    }
+  } catch (err) {
+    showStatus(jiraUserStatus, err.message || 'Failed to fetch', true);
   }
 });
 

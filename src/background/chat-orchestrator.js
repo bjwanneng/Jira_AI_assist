@@ -208,12 +208,26 @@ export class ChatOrchestrator {
     const toolCalls = [];
     const collectedSources = [];
     let rounds = 0;
+    // Wall-clock cap on the entire handle() call. Per-round check below
+    // returns a clean fallback if exceeded — bounds total user wait time
+    // regardless of which retry path the orchestrator is in.
+    const MAX_HANDLE_MS = 180000; // 3 minutes
+    const handleStartTime = Date.now();
     // Auto-continue accumulator: when finish_reason='length' (max_tokens hit
     // mid-answer) the model's response is truncated. We push the partial to
     // history, ask for continuation, and concatenate the next response. Cap
     // prevents unbounded growth if the model genuinely can't fit in N rounds.
-    const MAX_AUTO_CONTINUES = 4;
+    // 2 is intentional — reasoning models tend to re-emitting CoT on each
+    // continuation rather than picking up where they left off, so more
+    // retries rarely help and burn minutes of user time.
+    const MAX_AUTO_CONTINUES = 2;
+    // Separate budget for the "truncated tool call" retry path. Previously
+    // this shared PATHOLOGICAL_SAFETY_NET (100), which meant a model that
+    // kept emitting partial JSON could loop up to 100 times — each iteration
+    // taking 30s-2min on a reasoning model. Cap it tightly.
+    const MAX_TRUNCATED_RETRIES = 2;
     let continueCount = 0;
+    let truncatedRetryCount = 0;
     let pendingPartial = '';
     // Mark the position in conversationHistory where the auto-continue
     // sequence (partial + "continue" prompts) started, so we can collapse
@@ -223,6 +237,18 @@ export class ChatOrchestrator {
     // Tool loop: LLM may call tools, we execute and feed back, repeat until
     // the model returns a final answer with no tool calls.
     while (rounds < PATHOLOGICAL_SAFETY_NET) {
+      // Wall-clock cap. If the orchestrator has been running too long (slow
+      // reasoning model looping on truncated tool calls, stuck tool, etc.),
+      // bail out with a clean message so the user isn't staring at
+      // "Thinking..." forever.
+      if (Date.now() - handleStartTime > MAX_HANDLE_MS) {
+        console.warn('[orchestrator] handle() exceeded %dms wall clock, bailing out', MAX_HANDLE_MS);
+        const wallMsg = `This query is taking too long (${Math.round(MAX_HANDLE_MS / 1000)}s cap). Try a more focused question, or check that your LLM endpoint is responsive (Settings → LLM → Test LLM Connection).`;
+        this.conversationHistory.push({ role: 'assistant', content: wallMsg });
+        await this.persist();
+        return { content: wallMsg, toolCalls };
+      }
+
       const context = this.executor.cache.get('currentIssue');
       const related = this.executor.cache.get('relatedIssues') || [];
       const confluence = this.executor.cache.get('confluencePages') || [];
@@ -241,22 +267,120 @@ export class ChatOrchestrator {
       // post-call computation below).
       const round = toolCalls.filter((t) => t.name === 'reasoning').length + 1;
       let roundStarted = false;
-      const response = await this.llm.chatStream(messages, {}, (delta) => {
-        if (delta.reasoning && onDelta) {
-          if (!roundStarted) {
-            roundStarted = true;
-            onDelta({ kind: 'reasoning_start', round, text: delta.reasoning });
-          } else {
-            onDelta({ kind: 'reasoning_delta', round, text: delta.reasoning });
+      let contentBuf = '';
+      let contentReasoningSent = 0;
+      // Default max_tokens when none is configured: 16384. Reasoning models
+      // (doubao-seed, GLM, DeepSeek-R1) put CoT in reasoning_content which
+      // shares the max_tokens budget with content. 8192 was tight enough that
+      // a long reasoning block could eat the entire budget before the tool
+      // call JSON was emitted, truncating the response mid-tag and stalling
+      // the orchestrator. 16384 leaves comfortable room for CoT + JSON.
+      const configuredMax = Number(this.config.llmMaxTokens) || 0;
+      const streamOpts = configuredMax > 0 ? {} : { maxTokens: 16384 };
+      let response;
+      try {
+        response = await this.llm.chatStream(messages, streamOpts, (delta) => {
+          // Native reasoning_content stream (GLM, DeepSeek-R1, QwQ, ...)
+          if (delta.reasoning && onDelta) {
+            if (!roundStarted) {
+              roundStarted = true;
+              onDelta({ kind: 'reasoning_start', round, text: delta.reasoning });
+            } else {
+              onDelta({ kind: 'reasoning_delta', round, text: delta.reasoning });
+            }
           }
+          // Content-based reasoning (non-reasoning models using <reasoning> tag
+          // convention per the system prompt). Without this, the user sees a
+          // static "Thinking..." placeholder for minutes while the model
+          // generates its chain-of-thought inside the content stream.
+          if (delta.content && onDelta && !delta.reasoning) {
+            contentBuf += delta.content;
+            const m = contentBuf.match(/<reasoning>([\s\S]*?)(?:<\/reasoning>|$)/);
+            if (m) {
+              const text = m[1];
+              if (text.length > contentReasoningSent) {
+                const chunk = text.slice(contentReasoningSent);
+                if (!roundStarted) {
+                  roundStarted = true;
+                  onDelta({ kind: 'reasoning_start', round, text: chunk });
+                } else {
+                  onDelta({ kind: 'reasoning_delta', round, text: chunk });
+                }
+                contentReasoningSent = text.length;
+              }
+            }
+          }
+        });
+      } catch (streamErr) {
+        // chatStream threw (timeout, network, host permission, etc.). Don't
+        // just propagate — surface the streamed reasoning (if any) plus a
+        // readable error so the user keeps the visible thinking context and
+        // sees what went wrong, instead of an opaque bubble.
+        console.error('[orchestrator] chatStream threw on round %d:', rounds + 1, streamErr?.message || streamErr);
+        const partialReasoning = contentBuf && /<reasoning>/.test(contentBuf)
+          ? (contentBuf.match(/<reasoning>([\s\S]*?)(?:<\/reasoning>|$)/)?.[1] || '').trim()
+          : '';
+        if (partialReasoning) {
+          toolCalls.push({
+            name: 'reasoning',
+            args: {},
+            result: { thought: partialReasoning, round, _displayOnly: true, _streamed: roundStarted }
+          });
         }
-      });
+        const userMsg = `The LLM call failed mid-stream (${streamErr?.message || 'unknown error'}). The reasoning above was partially captured. Please retry, or check Settings → LLM host permission and network.`;
+        this.conversationHistory.push({ role: 'assistant', content: userMsg });
+        await this.persist();
+        return { content: userMsg, toolCalls };
+      }
       const content = response.content || '';
       // Reasoning models (GLM-4.5/4.6, DeepSeek-R1, QwQ, ...) put their
       // chain-of-thought in `reasoning_content`, NOT in `content`. Non-reasoning
       // models that follow the system prompt use the <reasoning>...</reasoning>
       // tag convention. Try the native field first, fall back to the tag.
       const reasoning = response.reasoning_content || parseReasoning(content);
+
+      // Surface the reasoning to toolCalls EARLY (before any bail-out / retry
+      // path) so the UI correctly tracks the streamed reasoning card via the
+      // _streamed flag even when we return from a bail-out path.
+      if (reasoning) {
+        toolCalls.push({
+          name: 'reasoning',
+          args: {},
+          result: { thought: reasoning, round, _displayOnly: true, _streamed: roundStarted }
+        });
+      }
+
+      const preliminaryContent = pendingPartial + content;
+      const truncated = response.finish_reason === 'length';
+
+      // Reasoning-truncation bail-out. Trigger on CONTENT SIGNATURE ALONE
+      // (open <reasoning> tag with no close and no JSON attempt) — do NOT
+      // require finish_reason='length', because some SSE endpoints omit
+      // finish_reason or send it as null on truncated responses, which would
+      // bypass this bail-out and let the orchestrator loop on retries.
+      // Auto-continuing here just makes the model re-reason and re-truncate —
+      // a multi-minute "Thinking..." stall. Finalize now with a clean message;
+      // the streamed reasoning card is already on screen.
+      const hasUnclosedReasoning = /<reasoning>/.test(preliminaryContent) && !/<\/reasoning>/.test(preliminaryContent);
+      // Only match explicit tool-call markers — a loose "name": pattern can
+      // false-positive on reasoning prose and suppress this bail-out.
+      const hasJsonAttempt = /```json|"tool_calls"/.test(preliminaryContent);
+      if (hasUnclosedReasoning && !hasJsonAttempt) {
+        console.warn('[orchestrator] response has unclosed <reasoning> with no JSON attempt (finish_reason=%s) — bailing out instead of looping',
+          response.finish_reason);
+        // Collapse any prior auto-continue sequence so history stays clean.
+        if (continueStartIdx >= 0 && continueStartIdx < this.conversationHistory.length) {
+          this.conversationHistory.splice(continueStartIdx);
+        }
+        const bailMsg = 'I ran out of token budget while thinking through this query, before reaching a tool call. Please try a more focused question, or raise the **Max tokens** setting (Settings → LLM).';
+        // Push ONE clean assistant turn: human-facing text only (unclosed
+        // <reasoning> tag stripped) so future rounds don't see raw meta tags,
+        // and the model doesn't see two consecutive assistant messages.
+        const visiblePart = stripMeta(preliminaryContent);
+        this.conversationHistory.push({ role: 'assistant', content: visiblePart ? `${visiblePart}\n\n${bailMsg}` : bailMsg });
+        await this.persist();
+        return { content: bailMsg, toolCalls, reasoning };
+      }
 
       // ============================================================
       // AUTO-CONTINUE on max_tokens truncation
@@ -269,12 +393,6 @@ export class ChatOrchestrator {
       //   - finish_reason === 'length' (not 'stop', not 'tool_calls')
       //   - no tool call JSON in the content (tool truncation has its own path)
       //   - under the MAX_AUTO_CONTINUES cap
-      //
-      // The partial content is pushed to history + a "continue" user message,
-      // and the next iteration's response is concatenated onto pendingPartial
-      // to form the full answer.
-      const preliminaryContent = pendingPartial + content;
-      const truncated = response.finish_reason === 'length';
       if (truncated && continueCount < MAX_AUTO_CONTINUES && !parseToolCalls(preliminaryContent)) {
         continueCount++;
         console.warn('[orchestrator] response truncated (finish_reason=length), auto-continuing (%d/%d)',
@@ -289,7 +407,7 @@ export class ChatOrchestrator {
         this.conversationHistory.push({ role: 'assistant', content });
         this.conversationHistory.push({
           role: 'user',
-          content: 'Please continue from where you left off. Do not repeat what you already wrote, just keep going and finish the response.'
+          content: 'Continue. Output ONLY the remaining text — no <reasoning> block, no explanation, just the rest of the response.'
         });
         rounds++;
         await this.persist();
@@ -311,32 +429,24 @@ export class ChatOrchestrator {
       // Use mergedContent for all downstream parsing/display.
       const effectiveContent = mergedContent;
 
-      // Surface every round's thinking to the UI — don't dedup. In a multi-
-      // round tool loop the user wants to see "plan search" → "review results"
-      // → "synthesize answer" as separate cards, not just the first one.
-      // The `_streamed` flag tells the UI the thinking was already rendered
-      // incrementally via CHAT_DELTA — skip re-rendering it from the final
-      // response to avoid a duplicate card.
-      if (reasoning) {
-        toolCalls.push({
-          name: 'reasoning',
-          args: {},
-          result: { thought: reasoning, round, _displayOnly: true, _streamed: roundStarted }
-        });
-      }
+      // (Reasoning was already pushed to toolCalls above, before the bail-out
+      // and auto-continue checks, so the UI tracks the streamed reasoning card
+      // correctly on every return path.)
 
       const requestedTools = parseToolCalls(effectiveContent);
       if (!requestedTools) {
         // Check if this looks like a TRUNCATED tool call attempt (model meant
         // to call a tool but the JSON got cut off by max_tokens).
-        if (looksLikeTruncatedToolCall(effectiveContent) && rounds < PATHOLOGICAL_SAFETY_NET - 2) {
-          console.warn('[orchestrator] detected truncated tool call, asking model to retry one-at-a-time');
+        if (looksLikeTruncatedToolCall(effectiveContent) && truncatedRetryCount < MAX_TRUNCATED_RETRIES) {
+          truncatedRetryCount++;
+          console.warn('[orchestrator] detected truncated tool call, asking model to retry one-at-a-time (%d/%d)',
+            truncatedRetryCount, MAX_TRUNCATED_RETRIES);
           // Push the truncated attempt so the model sees its own context, then
           // ask it to retry with a SINGLE tool call.
           this.conversationHistory.push({ role: 'assistant', content: effectiveContent });
           this.conversationHistory.push({
             role: 'user',
-            content: 'Your previous tool call JSON was truncated (likely by max_tokens). Please make ONE tool call at a time now, with a minimal JSON. Do not batch multiple tool calls in a single response.'
+            content: 'Previous JSON was truncated. SKIP ALL REASONING. Output ONLY the tool call JSON block, nothing else:\n```json\n{"tool_calls": [{"name": "TOOL_NAME", "arguments": {"key": "value"}}]}\n```'
           });
           rounds++;
           continue;
